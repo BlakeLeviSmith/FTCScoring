@@ -1,0 +1,1432 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>FTC DECODE Scoring System</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: #1a1a2e;
+            color: #e0e0e0;
+            min-height: 100vh;
+        }
+
+        header {
+            background: #16213e;
+            padding: 12px 24px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            border-bottom: 2px solid #0f3460;
+        }
+
+        header h1 {
+            font-size: 1.4rem;
+            color: #e94560;
+            letter-spacing: 1px;
+        }
+
+        header .subtitle {
+            font-size: 0.8rem;
+            color: #888;
+            margin-top: 2px;
+        }
+
+        .status-bar {
+            display: flex;
+            gap: 16px;
+            align-items: center;
+            font-size: 0.85rem;
+        }
+
+        .status-pill {
+            padding: 4px 12px;
+            border-radius: 12px;
+            font-size: 0.75rem;
+            font-weight: 600;
+        }
+
+        .status-pill.live { background: #2d6a4f; color: #b7e4c7; }
+        .status-pill.fps { background: #333; color: #aaa; }
+
+        .main-container {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 16px;
+            padding: 16px;
+            max-width: 1600px;
+            margin: 0 auto;
+        }
+
+        .feed-card {
+            background: #16213e;
+            border-radius: 8px;
+            overflow: hidden;
+            border: 1px solid #0f3460;
+        }
+
+        .feed-card .card-header {
+            padding: 8px 16px;
+            background: #0f3460;
+            font-weight: 600;
+            font-size: 0.9rem;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+
+        .feed-card img {
+            width: 100%;
+            display: block;
+            background: #000;
+            min-height: 300px;
+            object-fit: contain;
+        }
+
+        .scoring-panel {
+            grid-column: 1 / -1;
+            background: #16213e;
+            border-radius: 8px;
+            border: 1px solid #0f3460;
+            padding: 20px;
+        }
+
+        .scoring-panel h2 {
+            font-size: 1.1rem;
+            color: #e94560;
+            margin-bottom: 16px;
+            padding-bottom: 8px;
+            border-bottom: 1px solid #0f3460;
+        }
+
+        .motif-selector {
+            display: flex;
+            gap: 12px;
+            align-items: center;
+            margin-bottom: 20px;
+        }
+
+        .motif-selector label {
+            font-weight: 600;
+            color: #aaa;
+        }
+
+        .motif-btn {
+            padding: 8px 20px;
+            border: 2px solid #0f3460;
+            background: #1a1a2e;
+            color: #e0e0e0;
+            border-radius: 6px;
+            cursor: pointer;
+            font-size: 1rem;
+            font-weight: 700;
+            letter-spacing: 2px;
+            transition: all 0.2s;
+        }
+
+        .motif-btn:hover { border-color: #e94560; }
+        .motif-btn.active {
+            border-color: #e94560;
+            background: #e94560;
+            color: #fff;
+        }
+
+        .ramp-display {
+            display: flex;
+            gap: 6px;
+            margin: 16px 0;
+            align-items: flex-end;
+        }
+
+        .ramp-slot {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            gap: 4px;
+        }
+
+        .ramp-slot .index {
+            font-size: 0.65rem;
+            color: #666;
+        }
+
+        .ramp-slot .ball {
+            width: 48px;
+            height: 48px;
+            border-radius: 50%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-weight: 700;
+            font-size: 0.9rem;
+            border: 2px solid transparent;
+        }
+
+        .ball.green { background: #2d6a4f; color: #b7e4c7; border-color: #40916c; }
+        .ball.purple { background: #6a2d7a; color: #d4b7e4; border-color: #9c40b8; }
+        .ball.empty { background: #2a2a3e; color: #555; border: 2px dashed #333; }
+
+        .ramp-slot .expected {
+            font-size: 0.65rem;
+            color: #888;
+            padding: 2px 6px;
+            border-radius: 3px;
+        }
+
+        .ramp-slot .match-indicator {
+            font-size: 1rem;
+            height: 20px;
+        }
+
+        .match-yes { color: #2dd; }
+        .match-no { color: #e94560; }
+
+        .score-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+            gap: 12px;
+            margin-top: 20px;
+        }
+
+        .score-card {
+            background: #1a1a2e;
+            border: 1px solid #0f3460;
+            border-radius: 6px;
+            padding: 12px 16px;
+            text-align: center;
+        }
+
+        .score-card .label {
+            font-size: 0.75rem;
+            color: #888;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+        }
+
+        .score-card .value {
+            font-size: 2rem;
+            font-weight: 700;
+            margin-top: 4px;
+        }
+
+        .score-card .detail {
+            font-size: 0.75rem;
+            color: #666;
+            margin-top: 2px;
+        }
+
+        .score-card .value.total { color: #e94560; }
+        .score-card .value.classified { color: #2dd; }
+        .score-card .value.pattern { color: #ffd700; }
+        .score-card .value.overflow { color: #ff8c00; }
+
+        .controls-panel {
+            grid-column: 1 / -1;
+            background: #16213e;
+            border-radius: 8px;
+            border: 1px solid #0f3460;
+            padding: 16px 20px;
+        }
+
+        .controls-panel h3 {
+            font-size: 0.9rem;
+            color: #888;
+            margin-bottom: 12px;
+        }
+
+        .feed-selector {
+            display: flex;
+            gap: 8px;
+            flex-wrap: wrap;
+        }
+
+        .feed-btn {
+            padding: 6px 14px;
+            border: 1px solid #0f3460;
+            background: #1a1a2e;
+            color: #aaa;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 0.8rem;
+            transition: all 0.2s;
+        }
+
+        .feed-btn:hover { border-color: #e94560; color: #fff; }
+        .feed-btn.active { background: #0f3460; color: #fff; }
+
+        .detection-info {
+            margin-top: 12px;
+            font-size: 0.8rem;
+            color: #777;
+            font-family: monospace;
+        }
+
+        .cam-controls {
+            grid-column: 1 / -1;
+            background: #16213e;
+            border-radius: 8px;
+            border: 1px solid #0f3460;
+            padding: 16px 20px;
+        }
+
+        .cam-controls h3 {
+            font-size: 0.9rem;
+            color: #e94560;
+            margin-bottom: 12px;
+            padding-bottom: 8px;
+            border-bottom: 1px solid #0f3460;
+        }
+
+        .cam-controls-grid {
+            display: flex;
+            gap: 24px;
+            flex-wrap: wrap;
+            align-items: flex-end;
+        }
+
+        .cam-control-group {
+            display: flex;
+            flex-direction: column;
+            gap: 4px;
+        }
+
+        .cam-control-group label {
+            font-size: 0.75rem;
+            color: #888;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+        }
+
+        .cam-control-group select, .cam-control-group input[type="range"] {
+            background: #1a1a2e;
+            border: 1px solid #0f3460;
+            color: #e0e0e0;
+            padding: 6px 10px;
+            border-radius: 4px;
+            font-size: 0.85rem;
+        }
+
+        .cam-control-group .range-val {
+            font-size: 0.75rem;
+            color: #aaa;
+            text-align: center;
+        }
+
+        .fps-bar {
+            display: flex;
+            gap: 16px;
+            align-items: center;
+            padding: 8px 12px;
+            background: #1a1a2e;
+            border-radius: 4px;
+            font-family: monospace;
+            font-size: 0.8rem;
+        }
+
+        .fps-bar .fps-label { color: #888; }
+        .fps-bar .fps-value { font-weight: 700; min-width: 50px; }
+        .fps-good { color: #2d6a4f; }
+        .fps-warn { color: #ffd700; }
+        .fps-bad { color: #e94560; }
+
+        /* Detection Tuning Panel */
+        .tuning-panel {
+            grid-column: 1 / -1;
+            background: #16213e;
+            border-radius: 8px;
+            border: 1px solid #0f3460;
+            padding: 16px 20px;
+        }
+
+        .tuning-panel h3 {
+            font-size: 0.9rem;
+            color: #e94560;
+            margin-bottom: 4px;
+            padding-bottom: 8px;
+            border-bottom: 1px solid #0f3460;
+            cursor: pointer;
+            user-select: none;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+
+        .tuning-panel h3 .toggle-arrow {
+            font-size: 0.7rem;
+            color: #666;
+            transition: transform 0.2s;
+        }
+
+        .tuning-panel h3 .toggle-arrow.open { transform: rotate(90deg); }
+
+        .tuning-body { display: none; }
+        .tuning-body.open { display: block; }
+
+        .tuning-section {
+            margin-top: 16px;
+        }
+
+        .tuning-section h4 {
+            font-size: 0.8rem;
+            color: #aaa;
+            margin-bottom: 8px;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+        }
+
+        .slider-row {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            margin-bottom: 6px;
+        }
+
+        .slider-row label {
+            font-size: 0.75rem;
+            color: #888;
+            width: 30px;
+            text-align: right;
+            flex-shrink: 0;
+        }
+
+        .slider-row input[type="range"] {
+            flex: 1;
+            height: 6px;
+            -webkit-appearance: none;
+            background: #1a1a2e;
+            border-radius: 3px;
+            outline: none;
+        }
+
+        .slider-row input[type="range"]::-webkit-slider-thumb {
+            -webkit-appearance: none;
+            width: 14px;
+            height: 14px;
+            border-radius: 50%;
+            background: #e94560;
+            cursor: pointer;
+        }
+
+        .slider-row .slider-val {
+            font-size: 0.75rem;
+            color: #ccc;
+            font-family: monospace;
+            width: 32px;
+            text-align: right;
+            flex-shrink: 0;
+        }
+
+        .hsv-group {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 16px;
+        }
+
+        .hsv-column {
+            background: #1a1a2e;
+            border-radius: 6px;
+            padding: 12px;
+            border: 1px solid #0f3460;
+        }
+
+        .hsv-column h5 {
+            font-size: 0.75rem;
+            color: #888;
+            margin-bottom: 8px;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+        }
+
+        .hsv-column.green-col h5 { color: #40916c; }
+        .hsv-column.purple-col h5 { color: #9c40b8; }
+
+        .param-row {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            margin-bottom: 8px;
+        }
+
+        .param-row label {
+            font-size: 0.75rem;
+            color: #888;
+            width: 90px;
+            flex-shrink: 0;
+        }
+
+        .param-row input[type="range"] {
+            flex: 1;
+            height: 6px;
+            -webkit-appearance: none;
+            background: #1a1a2e;
+            border-radius: 3px;
+            outline: none;
+        }
+
+        .param-row input[type="range"]::-webkit-slider-thumb {
+            -webkit-appearance: none;
+            width: 14px;
+            height: 14px;
+            border-radius: 50%;
+            background: #e94560;
+            cursor: pointer;
+        }
+
+        .param-row .param-val {
+            font-size: 0.75rem;
+            color: #ccc;
+            font-family: monospace;
+            width: 55px;
+            text-align: right;
+            flex-shrink: 0;
+        }
+
+        .pixel-info {
+            margin-top: 12px;
+            padding: 12px;
+            background: #1a1a2e;
+            border-radius: 6px;
+            border: 1px solid #0f3460;
+            font-family: monospace;
+            font-size: 0.8rem;
+        }
+
+        .pixel-info .pi-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 8px;
+        }
+
+        .pixel-info .pi-title {
+            color: #e94560;
+            font-weight: 600;
+        }
+
+        .pixel-info .pi-hint {
+            color: #555;
+            font-size: 0.7rem;
+        }
+
+        .pixel-info .pi-row {
+            display: flex;
+            gap: 16px;
+            color: #aaa;
+        }
+
+        .pixel-info .pi-swatch {
+            width: 40px;
+            height: 40px;
+            border-radius: 4px;
+            border: 1px solid #333;
+            flex-shrink: 0;
+        }
+
+        .pixel-info .pi-values {
+            display: flex;
+            flex-direction: column;
+            gap: 2px;
+        }
+
+        .tuning-actions {
+            margin-top: 16px;
+            display: flex;
+            gap: 8px;
+        }
+
+        .tuning-actions button {
+            padding: 6px 16px;
+            border: 1px solid #0f3460;
+            background: #1a1a2e;
+            color: #aaa;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 0.8rem;
+            transition: all 0.2s;
+        }
+
+        .tuning-actions button:hover { border-color: #e94560; color: #fff; }
+        .tuning-actions button.primary { background: #e94560; color: #fff; border-color: #e94560; }
+        .tuning-actions button.primary:hover { background: #c73a52; }
+
+        /* Click-to-inspect crosshair cursor on raw feed */
+        .feed-card img.inspect-mode { cursor: crosshair; }
+
+        /* ROI Canvas Overlay */
+        .feed-wrapper { position: relative; }
+        #roi-canvas {
+            position: absolute;
+            top: 0; left: 0;
+            width: 100%; height: 100%;
+            pointer-events: none;
+        }
+        #roi-canvas.selecting {
+            pointer-events: auto;
+            cursor: crosshair;
+        }
+
+        /* Auto-tune controls */
+        .autotune-controls {
+            display: flex;
+            gap: 8px;
+            margin-top: 8px;
+            flex-wrap: wrap;
+            align-items: center;
+        }
+
+        .autotune-controls button {
+            padding: 6px 14px;
+            border: 1px solid #0f3460;
+            background: #1a1a2e;
+            color: #aaa;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 0.8rem;
+            transition: all 0.2s;
+        }
+        .autotune-controls button:hover:not(:disabled) { border-color: #e94560; color: #fff; }
+        .autotune-controls button:disabled { opacity: 0.4; cursor: default; }
+        .autotune-controls button.selecting-active {
+            background: #e94560; color: #fff; border-color: #e94560;
+        }
+
+        .progress-container {
+            margin-top: 8px;
+            display: none;
+        }
+        .progress-bar-bg {
+            background: #1a1a2e;
+            border-radius: 4px;
+            height: 20px;
+            overflow: hidden;
+            border: 1px solid #0f3460;
+        }
+        .progress-bar-fill {
+            background: #e94560;
+            height: 100%;
+            width: 0%;
+            transition: width 0.3s;
+            display: flex;
+            align-items: center;
+            padding-left: 8px;
+            font-size: 0.7rem;
+            color: #fff;
+            white-space: nowrap;
+        }
+        .progress-msg {
+            font-size: 0.75rem;
+            color: #888;
+            margin-top: 4px;
+        }
+
+        @media (max-width: 900px) {
+            .main-container { grid-template-columns: 1fr; }
+            .scoring-panel, .controls-panel, .cam-controls, .tuning-panel { grid-column: 1; }
+            .hsv-group { grid-template-columns: 1fr; }
+        }
+    </style>
+</head>
+<body>
+    <header>
+        <div>
+            <h1>FTC DECODE SCORING</h1>
+            <div class="subtitle">Vision-Based Match Scoring System</div>
+        </div>
+        <div class="status-bar">
+            <span class="status-pill live" id="status-pill">LIVE</span>
+            <span class="status-pill fps" id="grab-fps-display" title="Frames received from camera">CAM: --</span>
+            <span class="status-pill fps" id="proc-fps-display" title="Frames processed by vision">PROC: --</span>
+        </div>
+    </header>
+
+    <div class="main-container">
+        <!-- Video Feeds -->
+        <div class="feed-card">
+            <div class="card-header">
+                <span>Raw Camera Feed</span>
+            </div>
+            <div class="feed-wrapper">
+                <img id="raw-feed" src="/video_feed/raw" alt="Raw camera feed">
+                <canvas id="roi-canvas"></canvas>
+            </div>
+        </div>
+
+        <div class="feed-card">
+            <div class="card-header">
+                <span id="processed-label">Processed Feed</span>
+                <div class="feed-selector">
+                    <button class="feed-btn active" onclick="switchFeed('processed', this)">Detection</button>
+                    <button class="feed-btn" onclick="switchFeed('green_mask', this)">Green Mask</button>
+                    <button class="feed-btn" onclick="switchFeed('purple_mask', this)">Purple Mask</button>
+                </div>
+            </div>
+            <img id="processed-feed" src="/video_feed/processed" alt="Processed feed">
+        </div>
+
+        <!-- Camera Controls & FPS -->
+        <div class="cam-controls">
+            <h3>Camera &amp; Performance</h3>
+            <div class="cam-controls-grid">
+                <div class="cam-control-group">
+                    <label>Resolution</label>
+                    <select id="cam-resolution" onchange="setCamSetting('framesize', this.value)">
+                        <option value="4">QVGA (320x240)</option>
+                        <option value="5">CIF (400x296)</option>
+                        <option value="6" selected>VGA (640x480)</option>
+                        <option value="7">SVGA (800x600)</option>
+                        <option value="8">XGA (1024x768)</option>
+                    </select>
+                </div>
+                <div class="cam-control-group">
+                    <label>JPEG Quality (<span id="quality-val">12</span>)</label>
+                    <input type="range" id="cam-quality" min="8" max="50" value="12"
+                           oninput="document.getElementById('quality-val').textContent=this.value"
+                           onchange="setCamSetting('quality', this.value)">
+                    <div style="display:flex;justify-content:space-between;font-size:0.65rem;color:#666;">
+                        <span>Best</span><span>Fastest</span>
+                    </div>
+                </div>
+                <div class="fps-bar">
+                    <span class="fps-label">Camera In:</span>
+                    <span class="fps-value" id="grab-fps-val">--</span>
+                    <span class="fps-label">Vision Out:</span>
+                    <span class="fps-value" id="proc-fps-val">--</span>
+                </div>
+            </div>
+        </div>
+
+        <!-- Detection Tuning Panel -->
+        <div class="tuning-panel">
+            <h3 onclick="toggleTuning()">
+                Detection Tuning
+                <span class="toggle-arrow" id="tuning-arrow">&#9654;</span>
+            </h3>
+            <div class="tuning-body" id="tuning-body">
+
+                <!-- Pixel Inspector -->
+                <div class="pixel-info" id="pixel-info">
+                    <div class="pi-header">
+                        <span class="pi-title">Pixel Inspector</span>
+                        <span class="pi-hint">Click on the Raw Camera Feed to inspect a pixel</span>
+                    </div>
+                    <div class="pi-row">
+                        <div class="pi-swatch" id="pi-swatch" style="background: #333;"></div>
+                        <div class="pi-values" id="pi-values">
+                            <span>HSV: --</span>
+                            <span>YCrCb: --</span>
+                            <span>RGB: --</span>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- HSV Threshold Sliders -->
+                <div class="tuning-section">
+                    <h4>Color Thresholds (HSV)</h4>
+                    <div class="hsv-group">
+                        <div class="hsv-column green-col">
+                            <h5>Green HSV Range</h5>
+                            <div class="slider-row">
+                                <label>H lo</label>
+                                <input type="range" min="0" max="179" id="gh-lo" oninput="updateSliderVal(this); pushConfig()">
+                                <span class="slider-val" id="gh-lo-val">35</span>
+                            </div>
+                            <div class="slider-row">
+                                <label>H hi</label>
+                                <input type="range" min="0" max="179" id="gh-hi" oninput="updateSliderVal(this); pushConfig()">
+                                <span class="slider-val" id="gh-hi-val">85</span>
+                            </div>
+                            <div class="slider-row">
+                                <label>S lo</label>
+                                <input type="range" min="0" max="255" id="gs-lo" oninput="updateSliderVal(this); pushConfig()">
+                                <span class="slider-val" id="gs-lo-val">40</span>
+                            </div>
+                            <div class="slider-row">
+                                <label>S hi</label>
+                                <input type="range" min="0" max="255" id="gs-hi" oninput="updateSliderVal(this); pushConfig()">
+                                <span class="slider-val" id="gs-hi-val">255</span>
+                            </div>
+                            <div class="slider-row">
+                                <label>V lo</label>
+                                <input type="range" min="0" max="255" id="gv-lo" oninput="updateSliderVal(this); pushConfig()">
+                                <span class="slider-val" id="gv-lo-val">40</span>
+                            </div>
+                            <div class="slider-row">
+                                <label>V hi</label>
+                                <input type="range" min="0" max="255" id="gv-hi" oninput="updateSliderVal(this); pushConfig()">
+                                <span class="slider-val" id="gv-hi-val">255</span>
+                            </div>
+                            <h5 style="margin-top: 12px;">Green YCrCb Range</h5>
+                            <div class="slider-row">
+                                <label>Y lo</label>
+                                <input type="range" min="0" max="255" id="gy-lo" oninput="updateSliderVal(this); pushConfig()">
+                                <span class="slider-val" id="gy-lo-val">40</span>
+                            </div>
+                            <div class="slider-row">
+                                <label>Y hi</label>
+                                <input type="range" min="0" max="255" id="gy-hi" oninput="updateSliderVal(this); pushConfig()">
+                                <span class="slider-val" id="gy-hi-val">220</span>
+                            </div>
+                            <div class="slider-row">
+                                <label>Cr lo</label>
+                                <input type="range" min="0" max="255" id="gcr-lo" oninput="updateSliderVal(this); pushConfig()">
+                                <span class="slider-val" id="gcr-lo-val">0</span>
+                            </div>
+                            <div class="slider-row">
+                                <label>Cr hi</label>
+                                <input type="range" min="0" max="255" id="gcr-hi" oninput="updateSliderVal(this); pushConfig()">
+                                <span class="slider-val" id="gcr-hi-val">115</span>
+                            </div>
+                            <div class="slider-row">
+                                <label>Cb lo</label>
+                                <input type="range" min="0" max="255" id="gcb-lo" oninput="updateSliderVal(this); pushConfig()">
+                                <span class="slider-val" id="gcb-lo-val">0</span>
+                            </div>
+                            <div class="slider-row">
+                                <label>Cb hi</label>
+                                <input type="range" min="0" max="255" id="gcb-hi" oninput="updateSliderVal(this); pushConfig()">
+                                <span class="slider-val" id="gcb-hi-val">135</span>
+                            </div>
+                        </div>
+                        <div class="hsv-column purple-col">
+                            <h5>Purple HSV Range</h5>
+                            <div class="slider-row">
+                                <label>H lo</label>
+                                <input type="range" min="0" max="179" id="ph-lo" oninput="updateSliderVal(this); pushConfig()">
+                                <span class="slider-val" id="ph-lo-val">134</span>
+                            </div>
+                            <div class="slider-row">
+                                <label>H hi</label>
+                                <input type="range" min="0" max="179" id="ph-hi" oninput="updateSliderVal(this); pushConfig()">
+                                <span class="slider-val" id="ph-hi-val">170</span>
+                            </div>
+                            <div class="slider-row">
+                                <label>S lo</label>
+                                <input type="range" min="0" max="255" id="ps-lo" oninput="updateSliderVal(this); pushConfig()">
+                                <span class="slider-val" id="ps-lo-val">50</span>
+                            </div>
+                            <div class="slider-row">
+                                <label>S hi</label>
+                                <input type="range" min="0" max="255" id="ps-hi" oninput="updateSliderVal(this); pushConfig()">
+                                <span class="slider-val" id="ps-hi-val">255</span>
+                            </div>
+                            <div class="slider-row">
+                                <label>V lo</label>
+                                <input type="range" min="0" max="255" id="pv-lo" oninput="updateSliderVal(this); pushConfig()">
+                                <span class="slider-val" id="pv-lo-val">80</span>
+                            </div>
+                            <div class="slider-row">
+                                <label>V hi</label>
+                                <input type="range" min="0" max="255" id="pv-hi" oninput="updateSliderVal(this); pushConfig()">
+                                <span class="slider-val" id="pv-hi-val">255</span>
+                            </div>
+                            <h5 style="margin-top: 12px;">Purple YCrCb Range</h5>
+                            <div class="slider-row">
+                                <label>Y lo</label>
+                                <input type="range" min="0" max="255" id="py-lo" oninput="updateSliderVal(this); pushConfig()">
+                                <span class="slider-val" id="py-lo-val">40</span>
+                            </div>
+                            <div class="slider-row">
+                                <label>Y hi</label>
+                                <input type="range" min="0" max="255" id="py-hi" oninput="updateSliderVal(this); pushConfig()">
+                                <span class="slider-val" id="py-hi-val">220</span>
+                            </div>
+                            <div class="slider-row">
+                                <label>Cr lo</label>
+                                <input type="range" min="0" max="255" id="pcr-lo" oninput="updateSliderVal(this); pushConfig()">
+                                <span class="slider-val" id="pcr-lo-val">130</span>
+                            </div>
+                            <div class="slider-row">
+                                <label>Cr hi</label>
+                                <input type="range" min="0" max="255" id="pcr-hi" oninput="updateSliderVal(this); pushConfig()">
+                                <span class="slider-val" id="pcr-hi-val">200</span>
+                            </div>
+                            <div class="slider-row">
+                                <label>Cb lo</label>
+                                <input type="range" min="0" max="255" id="pcb-lo" oninput="updateSliderVal(this); pushConfig()">
+                                <span class="slider-val" id="pcb-lo-val">140</span>
+                            </div>
+                            <div class="slider-row">
+                                <label>Cb hi</label>
+                                <input type="range" min="0" max="255" id="pcb-hi" oninput="updateSliderVal(this); pushConfig()">
+                                <span class="slider-val" id="pcb-hi-val">220</span>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Detection Parameters -->
+                <div class="tuning-section">
+                    <h4>Contour Filtering</h4>
+                    <div class="param-row">
+                        <label>Min Area</label>
+                        <input type="range" min="50" max="5000" step="50" id="min-area" oninput="updateParamVal(this); pushConfig()">
+                        <span class="param-val" id="min-area-val">300</span>
+                    </div>
+                    <div class="param-row">
+                        <label>Max Area</label>
+                        <input type="range" min="5000" max="200000" step="1000" id="max-area" oninput="updateParamVal(this); pushConfig()">
+                        <span class="param-val" id="max-area-val">100000</span>
+                    </div>
+                    <div class="param-row">
+                        <label>Min Circularity</label>
+                        <input type="range" min="0" max="100" id="min-circ" oninput="updateParamVal(this, 100); pushConfig()">
+                        <span class="param-val" id="min-circ-val">0.40</span>
+                    </div>
+                    <div class="param-row">
+                        <label>Min Solidity</label>
+                        <input type="range" min="0" max="100" id="min-solid" oninput="updateParamVal(this, 100); pushConfig()">
+                        <span class="param-val" id="min-solid-val">0.70</span>
+                    </div>
+                </div>
+
+                <!-- Auto-Tune -->
+                <div class="tuning-section">
+                    <h4>Auto-Tune</h4>
+                    <p style="font-size:0.75rem;color:#555;margin-bottom:6px;">
+                        1. Click "Select ROI" then draw a rectangle on the raw feed around the balls<br>
+                        2. Click "Tune Green" or "Tune Purple" to auto-optimize thresholds
+                    </p>
+                    <div class="autotune-controls">
+                        <button id="roi-btn" onclick="startROISelect()">Select ROI</button>
+                        <button id="tune-green-btn" onclick="startAutoTune('green')" disabled
+                                style="border-color:#40916c;color:#40916c;">Tune Green</button>
+                        <button id="tune-purple-btn" onclick="startAutoTune('purple')" disabled
+                                style="border-color:#9c40b8;color:#9c40b8;">Tune Purple</button>
+                    </div>
+                    <div class="progress-container" id="autotune-progress">
+                        <div class="progress-bar-bg">
+                            <div class="progress-bar-fill" id="progress-bar"></div>
+                        </div>
+                        <div class="progress-msg" id="progress-msg"></div>
+                    </div>
+                </div>
+
+                <!-- Actions -->
+                <div class="tuning-actions">
+                    <button class="primary" onclick="saveConfig()">Save to config.py</button>
+                    <button onclick="resetConfig()">Reset Defaults</button>
+                </div>
+            </div>
+        </div>
+
+        <!-- Scoring Panel -->
+        <div class="scoring-panel">
+            <h2>Scoring</h2>
+
+            <!-- MOTIF Selector -->
+            <div class="motif-selector">
+                <label>MOTIF:</label>
+                <button class="motif-btn active" id="btn-GPP" onclick="setMotif('GPP')">GPP</button>
+                <button class="motif-btn" id="btn-PGP" onclick="setMotif('PGP')">PGP</button>
+                <button class="motif-btn" id="btn-PPG" onclick="setMotif('PPG')">PPG</button>
+            </div>
+
+            <!-- RAMP Visualization -->
+            <div style="display: flex; align-items: center; gap: 12px; margin-bottom: 4px;">
+                <span style="font-size: 0.75rem; color: #666; width: 60px;">GATE</span>
+                <div style="flex: 1; height: 1px; background: #333;"></div>
+                <span style="font-size: 0.75rem; color: #666; width: 60px; text-align: right;">SQUARE</span>
+            </div>
+
+            <div class="ramp-display" id="ramp-display">
+                <!-- Filled by JS -->
+            </div>
+
+            <!-- Score Cards -->
+            <div class="score-grid">
+                <div class="score-card">
+                    <div class="label">Total Points</div>
+                    <div class="value total" id="total-points">0</div>
+                </div>
+                <div class="score-card">
+                    <div class="label">Classified</div>
+                    <div class="value classified" id="classified-points">0</div>
+                    <div class="detail" id="classified-detail">0 balls x 3 pts</div>
+                </div>
+                <div class="score-card">
+                    <div class="label">Pattern Match</div>
+                    <div class="value pattern" id="pattern-points">0</div>
+                    <div class="detail" id="pattern-detail">0/0 positions</div>
+                </div>
+                <div class="score-card">
+                    <div class="label">Overflow</div>
+                    <div class="value overflow" id="overflow-points">0</div>
+                    <div class="detail" id="overflow-detail">0 balls x 1 pt</div>
+                </div>
+                <div class="score-card">
+                    <div class="label">Balls Detected</div>
+                    <div class="value" id="ball-count" style="color: #e0e0e0;">0</div>
+                    <div class="detail" id="detection-pattern">--</div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        let currentMotif = 'GPP';
+
+        function switchFeed(feed, btn) {
+            const img = document.getElementById('processed-feed');
+            img.src = '/video_feed/' + feed + '?' + Date.now();
+            document.querySelectorAll('.feed-selector .feed-btn').forEach(b => b.classList.remove('active'));
+            btn.classList.add('active');
+            const labels = { processed: 'Processed Feed', green_mask: 'Green Mask', purple_mask: 'Purple Mask' };
+            document.getElementById('processed-label').textContent = labels[feed] || 'Feed';
+        }
+
+        function setMotif(motif) {
+            currentMotif = motif;
+            fetch('/api/motif', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ motif: motif })
+            });
+            document.querySelectorAll('.motif-btn').forEach(b => b.classList.remove('active'));
+            document.getElementById('btn-' + motif).classList.add('active');
+        }
+
+        function setCamSetting(key, val) {
+            fetch('/api/cam_control', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ key: key, value: parseInt(val) })
+            }).then(r => r.json()).then(d => {
+                if (d.status !== 'ok') console.warn('Camera setting failed:', d);
+            }).catch(e => console.warn('Camera control error:', e));
+        }
+
+        function fpsColor(fps) {
+            if (fps >= 10) return 'fps-good';
+            if (fps >= 5) return 'fps-warn';
+            return 'fps-bad';
+        }
+
+        function updateFpsDisplay(grabFps, procFps) {
+            const grabEl = document.getElementById('grab-fps-val');
+            const procEl = document.getElementById('proc-fps-val');
+            const grabPill = document.getElementById('grab-fps-display');
+            const procPill = document.getElementById('proc-fps-display');
+
+            grabEl.textContent = grabFps;
+            grabEl.className = 'fps-value ' + fpsColor(grabFps);
+            procEl.textContent = procFps;
+            procEl.className = 'fps-value ' + fpsColor(procFps);
+
+            grabPill.textContent = 'CAM: ' + grabFps;
+            procPill.textContent = 'PROC: ' + procFps;
+        }
+
+        function renderRamp(scores) {
+            const container = document.getElementById('ramp-display');
+            let html = '';
+
+            for (let i = 0; i < 9; i++) {
+                const expected = scores.motif_pattern[i] || '?';
+                const actual = scores.ramp_colors[i] || null;
+                const matched = scores.pattern_matches[i] || false;
+
+                let ballClass = 'empty';
+                let ballText = '--';
+                if (actual === 'G') { ballClass = 'green'; ballText = 'G'; }
+                else if (actual === 'P') { ballClass = 'purple'; ballText = 'P'; }
+
+                let matchIcon = '';
+                if (actual) {
+                    matchIcon = matched
+                        ? '<span class="match-yes">&#10003;</span>'
+                        : '<span class="match-no">&#10007;</span>';
+                }
+
+                const expectedClass = expected === 'G' ? 'color: #40916c' : 'color: #9c40b8';
+
+                html += `
+                    <div class="ramp-slot">
+                        <div class="match-indicator">${matchIcon}</div>
+                        <div class="ball ${ballClass}">${ballText}</div>
+                        <div class="expected" style="${expectedClass}">${expected}</div>
+                        <div class="index">${i + 1}</div>
+                    </div>
+                `;
+            }
+            container.innerHTML = html;
+        }
+
+        function updateScores() {
+            fetch('/api/scores')
+                .then(r => r.json())
+                .then(scores => {
+                    document.getElementById('total-points').textContent = scores.total_points;
+                    document.getElementById('classified-points').textContent = scores.classified_points;
+                    document.getElementById('classified-detail').textContent =
+                        scores.classified_count + ' balls x 3 pts';
+                    document.getElementById('pattern-points').textContent = scores.pattern_points;
+                    document.getElementById('pattern-detail').textContent =
+                        scores.pattern_match_count + '/' + scores.classified_count + ' positions';
+                    document.getElementById('overflow-points').textContent = scores.overflow_points;
+                    document.getElementById('overflow-detail').textContent =
+                        scores.overflow_count + ' balls x 1 pt';
+                    document.getElementById('ball-count').textContent = scores.ball_count;
+                    document.getElementById('detection-pattern').textContent =
+                        'Stable: ' + (scores.stable_pattern || '--');
+
+                    updateFpsDisplay(scores.grab_fps, scores.fps);
+                    renderRamp(scores);
+                })
+                .catch(() => {
+                    document.getElementById('status-pill').textContent = 'OFFLINE';
+                    document.getElementById('status-pill').style.background = '#6a2d2d';
+                });
+        }
+
+        // Poll scores every 500ms
+        setInterval(updateScores, 500);
+        updateScores();
+
+        // ============= Detection Tuning =============
+        let configPushTimer = null;
+
+        function toggleTuning() {
+            const body = document.getElementById('tuning-body');
+            const arrow = document.getElementById('tuning-arrow');
+            body.classList.toggle('open');
+            arrow.classList.toggle('open');
+            if (body.classList.contains('open')) {
+                loadConfig();
+                // Enable inspect mode on raw feed
+                document.getElementById('raw-feed').classList.add('inspect-mode');
+            } else {
+                document.getElementById('raw-feed').classList.remove('inspect-mode');
+            }
+        }
+
+        function updateSliderVal(el) {
+            document.getElementById(el.id + '-val').textContent = el.value;
+        }
+
+        function updateParamVal(el, divisor) {
+            const val = divisor ? (el.value / divisor).toFixed(2) : el.value;
+            document.getElementById(el.id + '-val').textContent = val;
+        }
+
+        function loadConfig() {
+            fetch('/api/config').then(r => r.json()).then(c => {
+                // Green HSV
+                setSlider('gh-lo', c.green_hsv.lower[0]);
+                setSlider('gs-lo', c.green_hsv.lower[1]);
+                setSlider('gv-lo', c.green_hsv.lower[2]);
+                setSlider('gh-hi', c.green_hsv.upper[0]);
+                setSlider('gs-hi', c.green_hsv.upper[1]);
+                setSlider('gv-hi', c.green_hsv.upper[2]);
+
+                // Green YCrCb
+                if (c.green_ycrcb) {
+                    setSlider('gy-lo', c.green_ycrcb.lower[0]);
+                    setSlider('gcr-lo', c.green_ycrcb.lower[1]);
+                    setSlider('gcb-lo', c.green_ycrcb.lower[2]);
+                    setSlider('gy-hi', c.green_ycrcb.upper[0]);
+                    setSlider('gcr-hi', c.green_ycrcb.upper[1]);
+                    setSlider('gcb-hi', c.green_ycrcb.upper[2]);
+                }
+
+                // Purple HSV
+                setSlider('ph-lo', c.purple_hsv.lower[0]);
+                setSlider('ps-lo', c.purple_hsv.lower[1]);
+                setSlider('pv-lo', c.purple_hsv.lower[2]);
+                setSlider('ph-hi', c.purple_hsv.upper[0]);
+                setSlider('ps-hi', c.purple_hsv.upper[1]);
+                setSlider('pv-hi', c.purple_hsv.upper[2]);
+
+                // Purple YCrCb
+                if (c.purple_ycrcb) {
+                    setSlider('py-lo', c.purple_ycrcb.lower[0]);
+                    setSlider('pcr-lo', c.purple_ycrcb.lower[1]);
+                    setSlider('pcb-lo', c.purple_ycrcb.lower[2]);
+                    setSlider('py-hi', c.purple_ycrcb.upper[0]);
+                    setSlider('pcr-hi', c.purple_ycrcb.upper[1]);
+                    setSlider('pcb-hi', c.purple_ycrcb.upper[2]);
+                }
+
+                // Detection params
+                setSlider('min-area', c.min_area);
+                setSlider('max-area', c.max_area);
+                setSlider('min-circ', Math.round(c.min_circularity * 100));
+                setSlider('min-solid', Math.round(c.min_solidity * 100));
+
+                // Update displayed values
+                document.getElementById('min-circ-val').textContent = c.min_circularity.toFixed(2);
+                document.getElementById('min-solid-val').textContent = c.min_solidity.toFixed(2);
+            });
+        }
+
+        function setSlider(id, val) {
+            const el = document.getElementById(id);
+            if (el) {
+                el.value = val;
+                const valEl = document.getElementById(id + '-val');
+                if (valEl) valEl.textContent = val;
+            }
+        }
+
+        function getConfigFromSliders() {
+            return {
+                green_hsv: {
+                    lower: [+v('gh-lo'), +v('gs-lo'), +v('gv-lo')],
+                    upper: [+v('gh-hi'), +v('gs-hi'), +v('gv-hi')],
+                },
+                green_ycrcb: {
+                    lower: [+v('gy-lo'), +v('gcr-lo'), +v('gcb-lo')],
+                    upper: [+v('gy-hi'), +v('gcr-hi'), +v('gcb-hi')],
+                },
+                purple_hsv: {
+                    lower: [+v('ph-lo'), +v('ps-lo'), +v('pv-lo')],
+                    upper: [+v('ph-hi'), +v('ps-hi'), +v('pv-hi')],
+                },
+                purple_ycrcb: {
+                    lower: [+v('py-lo'), +v('pcr-lo'), +v('pcb-lo')],
+                    upper: [+v('py-hi'), +v('pcr-hi'), +v('pcb-hi')],
+                },
+                min_area: +v('min-area'),
+                max_area: +v('max-area'),
+                min_circularity: +v('min-circ') / 100,
+                min_solidity: +v('min-solid') / 100,
+            };
+        }
+
+        function v(id) { return document.getElementById(id).value; }
+
+        function pushConfig() {
+            // Debounce: push at most every 100ms to avoid flooding the server
+            if (configPushTimer) clearTimeout(configPushTimer);
+            configPushTimer = setTimeout(() => {
+                const cfg = getConfigFromSliders();
+                fetch('/api/config', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(cfg)
+                });
+            }, 100);
+        }
+
+        function saveConfig() {
+            const cfg = getConfigFromSliders();
+            fetch('/api/save_config', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(cfg)
+            }).then(r => r.json()).then(d => {
+                if (d.status === 'ok') {
+                    alert('Config saved to config.py!');
+                } else {
+                    alert('Save failed: ' + (d.message || 'unknown error'));
+                }
+            }).catch(e => alert('Save error: ' + e));
+        }
+
+        function resetConfig() {
+            // Re-read config.py from disk, then reload sliders
+            fetch('/api/reset_config', { method: 'POST' })
+                .then(r => r.json())
+                .then(d => {
+                    if (d.status === 'ok') {
+                        loadConfig();
+                    } else {
+                        alert('Reset failed: ' + (d.message || 'unknown'));
+                    }
+                })
+                .catch(e => alert('Reset error: ' + e));
+        }
+
+        // ============= Pixel Inspector =============
+        document.getElementById('raw-feed').addEventListener('click', function(e) {
+            if (!document.getElementById('tuning-body').classList.contains('open')) return;
+            if (isSelectingROI) return;  // Don't inspect while drawing ROI
+
+            const rect = this.getBoundingClientRect();
+            const nx = (e.clientX - rect.left) / rect.width;
+            const ny = (e.clientY - rect.top) / rect.height;
+
+            fetch('/api/pixel_info', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ x: nx, y: ny })
+            }).then(r => r.json()).then(d => {
+                if (d.status === 'error') return;
+
+                const swatch = document.getElementById('pi-swatch');
+                swatch.style.background = `rgb(${d.rgb[0]}, ${d.rgb[1]}, ${d.rgb[2]})`;
+
+                document.getElementById('pi-values').innerHTML =
+                    `<span>HSV: ${d.hsv[0]}, ${d.hsv[1]}, ${d.hsv[2]}</span>` +
+                    `<span>YCrCb: ${d.ycrcb[0]}, ${d.ycrcb[1]}, ${d.ycrcb[2]}</span>` +
+                    `<span>RGB: ${d.rgb[0]}, ${d.rgb[1]}, ${d.rgb[2]}</span>` +
+                    `<span style="color:#555;">Pixel: (${d.px}, ${d.py})</span>`;
+            });
+        });
+
+        // ============= ROI Selection & Auto-Tune =============
+        const roiCanvas = document.getElementById('roi-canvas');
+        const roiCtx = roiCanvas.getContext('2d');
+        let isSelectingROI = false;
+        let roiDragging = false;
+        let roiStart = null;
+        let roiEnd = null;
+        let roiNorm = null;
+
+        function startROISelect() {
+            isSelectingROI = true;
+            roiDragging = false;
+            roiStart = null;
+            roiEnd = null;
+            roiCanvas.classList.add('selecting');
+            const btn = document.getElementById('roi-btn');
+            btn.textContent = 'Draw on feed...';
+            btn.classList.add('selecting-active');
+        }
+
+        function finishROISelect() {
+            isSelectingROI = false;
+            roiCanvas.classList.remove('selecting');
+            const btn = document.getElementById('roi-btn');
+            btn.textContent = 'Select ROI';
+            btn.classList.remove('selecting-active');
+
+            if (roiStart && roiEnd) {
+                roiNorm = {
+                    x1: Math.max(0, Math.min(roiStart.x, roiEnd.x)),
+                    y1: Math.max(0, Math.min(roiStart.y, roiEnd.y)),
+                    x2: Math.min(1, Math.max(roiStart.x, roiEnd.x)),
+                    y2: Math.min(1, Math.max(roiStart.y, roiEnd.y)),
+                };
+                document.getElementById('tune-green-btn').disabled = false;
+                document.getElementById('tune-purple-btn').disabled = false;
+            }
+            drawROI();
+        }
+
+        roiCanvas.addEventListener('mousedown', function(e) {
+            if (!isSelectingROI) return;
+            e.preventDefault();
+            roiDragging = true;
+            const rect = this.getBoundingClientRect();
+            roiStart = {
+                x: (e.clientX - rect.left) / rect.width,
+                y: (e.clientY - rect.top) / rect.height
+            };
+            roiEnd = { ...roiStart };
+        });
+
+        roiCanvas.addEventListener('mousemove', function(e) {
+            if (!roiDragging) return;
+            const rect = this.getBoundingClientRect();
+            roiEnd = {
+                x: (e.clientX - rect.left) / rect.width,
+                y: (e.clientY - rect.top) / rect.height
+            };
+            drawROI();
+        });
+
+        roiCanvas.addEventListener('mouseup', function(e) {
+            if (!roiDragging) return;
+            roiDragging = false;
+            const rect = this.getBoundingClientRect();
+            roiEnd = {
+                x: (e.clientX - rect.left) / rect.width,
+                y: (e.clientY - rect.top) / rect.height
+            };
+            finishROISelect();
+        });
+
+        function drawROI() {
+            const img = document.getElementById('raw-feed');
+            roiCanvas.width = img.clientWidth;
+            roiCanvas.height = img.clientHeight;
+            roiCtx.clearRect(0, 0, roiCanvas.width, roiCanvas.height);
+
+            const s = roiStart;
+            const e = roiEnd || roiStart;
+            if (!s) return;
+
+            const x = Math.min(s.x, e.x) * roiCanvas.width;
+            const y = Math.min(s.y, e.y) * roiCanvas.height;
+            const w = Math.abs(e.x - s.x) * roiCanvas.width;
+            const h = Math.abs(e.y - s.y) * roiCanvas.height;
+
+            // Darken outside ROI
+            roiCtx.fillStyle = 'rgba(0, 0, 0, 0.45)';
+            roiCtx.fillRect(0, 0, roiCanvas.width, roiCanvas.height);
+            roiCtx.clearRect(x, y, w, h);
+
+            // ROI border
+            roiCtx.strokeStyle = '#e94560';
+            roiCtx.lineWidth = 2;
+            roiCtx.setLineDash([6, 3]);
+            roiCtx.strokeRect(x, y, w, h);
+            roiCtx.setLineDash([]);
+
+            // Label
+            roiCtx.fillStyle = '#e94560';
+            roiCtx.font = '12px monospace';
+            roiCtx.fillText('ROI', x + 4, y - 4);
+        }
+
+        let autotuneInterval = null;
+
+        function startAutoTune(color) {
+            if (!roiNorm) {
+                alert('Please select an ROI first');
+                return;
+            }
+
+            fetch('/api/autotune', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    roi: [roiNorm.x1, roiNorm.y1, roiNorm.x2, roiNorm.y2],
+                    color: color
+                })
+            });
+
+            document.getElementById('autotune-progress').style.display = 'block';
+            document.getElementById('tune-green-btn').disabled = true;
+            document.getElementById('tune-purple-btn').disabled = true;
+            document.getElementById('progress-bar').style.width = '0%';
+            document.getElementById('progress-msg').textContent = 'Starting...';
+
+            autotuneInterval = setInterval(pollAutoTune, 500);
+        }
+
+        function pollAutoTune() {
+            fetch('/api/autotune/status').then(r => r.json()).then(d => {
+                document.getElementById('progress-bar').style.width = d.progress + '%';
+                document.getElementById('progress-bar').textContent =
+                    d.progress > 10 ? d.progress + '%' : '';
+                document.getElementById('progress-msg').textContent = d.message || '';
+
+                if (!d.running && d.progress >= 100) {
+                    clearInterval(autotuneInterval);
+                    document.getElementById('tune-green-btn').disabled = false;
+                    document.getElementById('tune-purple-btn').disabled = false;
+
+                    // Reload sliders with optimized values
+                    loadConfig();
+
+                    if (d.result) {
+                        document.getElementById('progress-msg').textContent =
+                            d.message + ' (' + d.result.evaluations + ' evals)';
+                    }
+                } else if (!d.running && d.progress === 0 && d.message) {
+                    // Error state
+                    clearInterval(autotuneInterval);
+                    document.getElementById('tune-green-btn').disabled = false;
+                    document.getElementById('tune-purple-btn').disabled = false;
+                    document.getElementById('progress-bar').style.width = '100%';
+                    document.getElementById('progress-bar').style.background = '#c73a52';
+                }
+            });
+        }
+    </script>
+</body>
+</html>

@@ -1,0 +1,26 @@
+# YOLOv8 dataset config for FTC DECODE ball detection
+# 2 classes: green_ball (0), purple_ball (1)
+#
+# Directory structure:
+#   training/
+#     images/train/   <- training images
+#     images/val/     <- validation images
+#     labels/train/   <- YOLO format labels (.txt)
+#     labels/val/     <- YOLO format labels (.txt)
+#
+# Label format (one line per object):
+#   class_id  x_center  y_center  width  height
+#   (all values normalized 0-1 relative to image dimensions)
+#
+# Example label file content:
+#   0 0.45 0.62 0.03 0.04
+#   1 0.52 0.61 0.03 0.04
+
+path: .  # resolved relative to train.py working directory
+train: images/train
+val: images/val
+
+nc: 2
+names:
+  0: green_ball
+  1: purple_ball

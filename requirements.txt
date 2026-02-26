@@ -1,0 +1,12 @@
+# FTC DECODE Vision Scoring System
+# Core
+flask>=2.3
+opencv-python>=4.8
+numpy>=1.24
+requests>=2.31
+
+# YOLO detection (optional — only needed for --yolo mode)
+# Install CPU-only to avoid 2GB CUDA download:
+#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+#   pip install ultralytics
+ultralytics>=8.0

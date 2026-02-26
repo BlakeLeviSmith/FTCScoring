@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+.DS_Store
+training/runs/
+training/images/train/*.jpg
+training/images/val/*.jpg
+training/labels/train/*.txt
+training/labels/val/*.txt
+
