@@ -1,132 +1,15 @@
 """
 YOLOv8 nano ball detector for FTC DECODE scoring.
-Drop-in replacement for BallDetector — same detect() / draw_detections() interface.
 
-Adds lightweight per-stream IoU tracking so balls get stable track_ids across frames.
-This is used by RampTracker to count gate entries based on ID transitions rather
-than raw count deltas (more robust to missed frames of detection).
+Uses ultralytics' built-in BoT-SORT tracker (model.track with persist=True)
+for per-stream ball tracking. Each alliance ROI gets its own model instance
+to keep tracker state isolated.
 """
 
 import cv2
 import numpy as np
 import config
 from detector import StableDetector
-
-
-def _iou(box_a, box_b):
-    """Compute IoU between two boxes in (x, y, w, h) pixel format."""
-    ax1, ay1, aw, ah = box_a
-    bx1, by1, bw, bh = box_b
-    ax2, ay2 = ax1 + aw, ay1 + ah
-    bx2, by2 = bx1 + bw, by1 + bh
-
-    ix1 = max(ax1, bx1)
-    iy1 = max(ay1, by1)
-    ix2 = min(ax2, bx2)
-    iy2 = min(ay2, by2)
-
-    iw = max(0, ix2 - ix1)
-    ih = max(0, iy2 - iy1)
-    inter = iw * ih
-    if inter <= 0:
-        return 0.0
-
-    union = aw * ah + bw * bh - inter
-    if union <= 0:
-        return 0.0
-    return inter / union
-
-
-class SimpleIoUTracker:
-    """Assigns persistent IDs to balls based on IoU overlap between frames.
-
-    Not as sophisticated as ByteTrack, but works per-stream (each alliance ROI crop
-    has its own instance), so there's no cross-contamination between alliances.
-
-    Hysteresis: a track is kept alive for up to `max_missed` frames with no
-    matching detection, so a single frame of missed detection doesn't lose the ID.
-    """
-
-    def __init__(self, iou_threshold=0.1, max_missed=60):
-        self.next_id = 1
-        # id -> {"bbox": (x,y,w,h), "missed": int, "color": "G"|"P"}
-        self.tracks = {}
-        self.iou_threshold = iou_threshold
-        self.max_missed = max_missed
-
-    def reset(self):
-        self.next_id = 1
-        self.tracks = {}
-
-    def update(self, detections):
-        """Assign track_ids to a list of detection dicts (mutates them in place).
-
-        Returns the same list for convenience.
-        """
-        # Build matrix of IoU between existing tracks and new detections,
-        # restricted to same-color matches (we never want a green ball to
-        # inherit a purple ball's ID).
-        track_ids = list(self.tracks.keys())
-        assigned_tracks = set()
-        assigned_dets = set()
-
-        # Greedy match: strongest IoU first.
-        pairs = []
-        for ti, tid in enumerate(track_ids):
-            tinfo = self.tracks[tid]
-            for di, det in enumerate(detections):
-                if det.get("color") != tinfo["color"]:
-                    continue
-                det_bbox = (
-                    int(det.get("x", 0)),
-                    int(det.get("y", 0)),
-                    int(det.get("w", 0)),
-                    int(det.get("h", 0)),
-                )
-                score = _iou(tinfo["bbox"], det_bbox)
-                if score >= self.iou_threshold:
-                    pairs.append((score, tid, di, det_bbox))
-
-        pairs.sort(reverse=True, key=lambda p: p[0])
-        for score, tid, di, det_bbox in pairs:
-            if tid in assigned_tracks or di in assigned_dets:
-                continue
-            assigned_tracks.add(tid)
-            assigned_dets.add(di)
-            self.tracks[tid]["bbox"] = det_bbox
-            self.tracks[tid]["missed"] = 0
-            detections[di]["track_id"] = tid
-
-        # Unmatched detections get new IDs
-        for di, det in enumerate(detections):
-            if di in assigned_dets:
-                continue
-            new_id = self.next_id
-            self.next_id += 1
-            det_bbox = (
-                int(det.get("x", 0)),
-                int(det.get("y", 0)),
-                int(det.get("w", 0)),
-                int(det.get("h", 0)),
-            )
-            self.tracks[new_id] = {
-                "bbox": det_bbox,
-                "missed": 0,
-                "color": det.get("color", ""),
-            }
-            det["track_id"] = new_id
-
-        # Age unmatched tracks, drop stale ones
-        to_delete = []
-        for tid in track_ids:
-            if tid not in assigned_tracks:
-                self.tracks[tid]["missed"] += 1
-                if self.tracks[tid]["missed"] > self.max_missed:
-                    to_delete.append(tid)
-        for tid in to_delete:
-            del self.tracks[tid]
-
-        return detections
 
 
 class YOLODetector:
@@ -161,8 +44,6 @@ class YOLODetector:
         # especially for stationary balls being briefly occluded by robots.
         self.tracking_enabled = tracking_enabled
         self._stream_models = {}
-        # Fallback IoU trackers (used only if tracking is disabled).
-        self._trackers = {}
 
     def _get_stream_model(self, stream_id):
         from ultralytics import YOLO
@@ -170,26 +51,15 @@ class YOLODetector:
             self._stream_models[stream_id] = YOLO(self._model_path)
         return self._stream_models[stream_id]
 
-    def _get_tracker(self, stream_id):
-        if stream_id not in self._trackers:
-            self._trackers[stream_id] = SimpleIoUTracker()
-        return self._trackers[stream_id]
-
     def reset_tracker(self, stream_id=None):
-        """Reset tracker state (e.g. on match reset or stream switch).
+        """Reset tracker state by dropping per-stream model instances.
 
-        For BoT-SORT we drop the model instance so the next detect() rebuilds
-        with a fresh predictor/tracker. For the IoU fallback we reset the
-        per-stream tracker dict.
+        The next detect() call will rebuild a fresh model + BoT-SORT tracker.
         """
         if stream_id is None:
             self._stream_models = {}
-            for t in self._trackers.values():
-                t.reset()
         else:
             self._stream_models.pop(stream_id, None)
-            if stream_id in self._trackers:
-                self._trackers[stream_id].reset()
 
     def detect(self, frame, stream_id="default"):
         """
@@ -261,13 +131,7 @@ class YOLODetector:
                     "track_id": tid,
                 })
 
-        # If BoT-SORT is off (tracking_enabled=False), fall back to the
-        # simple IoU tracker so downstream code still gets track_ids.
-        if not self.tracking_enabled:
-            tracker = self._get_tracker(stream_id)
-            tracker.update(balls)
-
-        # Sort left to right (same as BallDetector)
+        # Sort left to right
         balls.sort(key=lambda b: b["center_x"])
         raw_pattern = "".join(b["color"] for b in balls)
         stable_pattern = self.stable.update(raw_pattern)
