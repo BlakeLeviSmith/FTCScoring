@@ -1,6 +1,14 @@
 """
 DECODE score calculation engine.
-Takes detected ball patterns and compares against the active MOTIF.
+
+Per FTC 2025-2026 Competition Manual §10.5:
+- CLASSIFIED / OVERFLOW are assessed THROUGHOUT the match (cumulative).
+- PATTERN is assessed at end-of-period, against artifacts on the RAMP
+  retained by the GATE, comparing each index to the MOTIF color.
+
+Classified/overflow counts are taken as cumulative totals from the
+RampTracker. Pattern comparison uses the live ramp snapshot sorted by
+spatial position along the ramp (caller provides the ordered list).
 """
 
 import config
@@ -18,26 +26,31 @@ class ScoreKeeper:
         self.ramp_colors = []
 
     def set_motif(self, motif_name):
-        """Set the active MOTIF (GPP, PGP, or PPG)."""
         motif_name = motif_name.upper()
         if motif_name in config.MOTIFS:
             self.motif_name = motif_name
             self.motif_pattern = list(config.MOTIFS[motif_name])
 
-    def update(self, detected_colors):
+    def update(self, ramp_colors_by_position,
+               classified_total=None, overflow_total=None):
         """
-        Update scores based on detected ball colors on the RAMP.
-
         Args:
-            detected_colors: list of color strings ["G", "P", "P", ...] in order
-                            from Gate (position 1) to Square (position 9).
-                            Max 9 items for CLASSIFIED, extras are OVERFLOW.
+            ramp_colors_by_position: list of "G"/"P" currently on the ramp,
+                sorted gate→square. Used ONLY for PATTERN matching.
+            classified_total: cumulative CLASSIFIED count from RampTracker.
+                If None, falls back to len(ramp_colors).
+            overflow_total: cumulative OVERFLOW count from RampTracker.
+                If None, falls back to 0.
         """
-        self.ramp_colors = detected_colors[:9]  # Max 9 CLASSIFIED
-        self.classified_count = len(self.ramp_colors)
-        self.overflow_count = max(0, len(detected_colors) - 9)
+        self.ramp_colors = ramp_colors_by_position[:9]
 
-        # Calculate pattern matches
+        if classified_total is not None:
+            self.classified_count = classified_total
+        else:
+            self.classified_count = len(self.ramp_colors)
+
+        self.overflow_count = overflow_total if overflow_total is not None else 0
+
         self.pattern_matches = []
         for i, color in enumerate(self.ramp_colors):
             if i < len(self.motif_pattern):
@@ -46,12 +59,6 @@ class ScoreKeeper:
                 self.pattern_matches.append(False)
 
     def get_scores(self):
-        """
-        Return current score breakdown.
-
-        Returns:
-            dict with all scoring info
-        """
         pattern_match_count = sum(1 for m in self.pattern_matches if m)
         classified_points = self.classified_count * config.POINTS_CLASSIFIED_TELEOP
         overflow_points = self.overflow_count * config.POINTS_OVERFLOW_TELEOP

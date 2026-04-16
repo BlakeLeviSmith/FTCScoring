@@ -1,0 +1,14 @@
+{
+  "red": {
+    "roi": null,
+    "gate": null,
+    "exit": null,
+    "divider": null
+  },
+  "blue": {
+    "roi": null,
+    "gate": null,
+    "exit": null,
+    "divider": null
+  }
+}

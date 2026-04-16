@@ -47,14 +47,16 @@ Automated scoring system for FTC 2025-2026 DECODE game. Uses a Freenove ESP32-S3
 
 ## Architecture
 - `app.py` — Flask server, two-thread architecture (grab + process), web API, connection monitor
-- `config.py` — all tunable parameters (thresholds, scoring, camera settings)
-- `detector.py` — BallDetector (HSV+YCrCb dual-mask) + StableDetector (temporal smoothing)
-- `yolo_detector.py` — YOLODetector (YOLOv8n, same interface as BallDetector)
+- `config.py` — all tunable parameters (scoring, camera, YOLO settings)
+- `detector.py` — StableDetector (temporal smoothing)
+- `yolo_detector.py` — YOLODetector (YOLOv8n, the only detection method)
 - `scorer.py` — ScoreKeeper, MOTIF pattern matching
-- `templates/index.html` — web dashboard with live feeds, scores, detection tuning panel
+- `templates/index.html` — web dashboard with live feeds, scores, YOLO tuning panel
 - `training/` — YOLOv8n training pipeline (train.py, capture_frames.py, dataset.yaml)
 
 See `docs/ARCHITECTURE.md` for full system design.
+See `docs/MODEL_ARCHITECTURE.md` for detection window + ball counting design.
+See `docs/TRAINING_DATA.md` for dataset sources and strategy.
 See `docs/SCORING_RULES.md` for DECODE scoring reference.
 See `docs/HARDWARE_SETUP.md` for ESP32-S3 setup.
 
@@ -62,16 +64,15 @@ See `docs/HARDWARE_SETUP.md` for ESP32-S3 setup.
 - Python 3.10+
 - OpenCV (cv2) for vision processing
 - NumPy for array operations
-- Color detection: dual-mask HSV + YCrCb approach for both green and purple
+- YOLO-only detection via ultralytics YOLOv8n
 - Config values in `config.py` (not hardcoded)
-- Both detectors implement same interface: `detect(frame)` -> `(balls, stable_pattern, raw_pattern, masks)`
+- Detector interface: `detect(frame)` -> `(balls, stable_pattern, raw_pattern, masks)`
 
 ## CLI Flags
 ```
-python app.py                    # Default: ESP32 WiFi + color detection
+python app.py                    # Default: ESP32 WiFi + YOLO detection
 python app.py --capture          # Use /capture polling instead of MJPEG stream
 python app.py --usb [INDEX]      # USB webcam
-python app.py --yolo             # YOLOv8n detection
 python app.py --yolo-model PATH  # Custom YOLO model path
 python app.py --stream-url URL   # Override stream URL
 python app.py --port PORT        # Custom web server port

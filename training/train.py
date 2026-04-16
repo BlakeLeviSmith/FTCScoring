@@ -47,6 +47,16 @@ def main():
     training_dir = os.path.dirname(os.path.abspath(__file__))
     dataset_yaml = os.path.join(training_dir, "dataset.yaml")
 
+    # Patch dataset.yaml path to absolute so ultralytics resolves correctly
+    import yaml
+    with open(dataset_yaml, "r") as f:
+        ds_config = yaml.safe_load(f)
+    ds_config["path"] = training_dir
+    patched_yaml = os.path.join(training_dir, "dataset_resolved.yaml")
+    with open(patched_yaml, "w") as f:
+        yaml.dump(ds_config, f, default_flow_style=False)
+    dataset_yaml = patched_yaml
+
     if not os.path.exists(dataset_yaml):
         print(f"Error: {dataset_yaml} not found")
         sys.exit(1)
@@ -109,6 +119,7 @@ def main():
             save_period=10,    # Save checkpoint every 10 epochs
             plots=True,        # Generate training plots
             verbose=True,
+            amp=False,         # Disable AMP — fixes MPS tensor index crash
         )
 
     # Print results location
@@ -120,7 +131,7 @@ def main():
     print(f"  Best model: {best_pt}")
     print()
     print("  To use in the scoring system:")
-    print(f"    python app.py --yolo --yolo-model {best_pt}")
+    print(f"    python app.py --yolo-model {best_pt}")
     print("=" * 60)
 
 
