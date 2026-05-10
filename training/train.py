@@ -74,7 +74,10 @@ def patch_albumentations_for_motion():
 
     from ultralytics.data import augment as _aug
 
-    def patched_init(self, p=1.0):
+    def patched_init(self, p=1.0, **kwargs):
+        # **kwargs absorbs any extra args newer ultralytics versions
+        # pass (e.g. `transforms=...` in 8.4+). We replace ultralytics'
+        # built-in pipeline entirely, so anything they pass is ignored.
         self.p = p
         # All our transforms are pixel-value-only (no spatial geometry
         # changes), so bboxes don't need to be transformed alongside.
