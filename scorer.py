@@ -24,6 +24,10 @@ class ScoreKeeper:
         self.overflow_count = 0
         self.pattern_matches = []
         self.ramp_colors = []
+        # Once locked at end-of-period, ramp_colors and pattern_matches
+        # stop updating from live frames so the score doesn't fluctuate
+        # after the period ends. Reset by ScoreKeeper.reset().
+        self._pattern_locked = False
 
     def set_motif(self, motif_name):
         motif_name = motif_name.upper()
@@ -42,7 +46,12 @@ class ScoreKeeper:
             overflow_total: cumulative OVERFLOW count from RampTracker.
                 If None, falls back to 0.
         """
-        self.ramp_colors = ramp_colors_by_position[:9]
+        # Pattern is frozen once a period ends — only counts continue
+        # to update, so the live-pass-through tripwires can keep ticking
+        # the displayed totals during the next period.
+        if not self._pattern_locked:
+            self.ramp_colors = ramp_colors_by_position[:9]
+            self.pattern_matches = self._compute_matches(self.ramp_colors)
 
         if classified_total is not None:
             self.classified_count = classified_total
@@ -51,12 +60,27 @@ class ScoreKeeper:
 
         self.overflow_count = overflow_total if overflow_total is not None else 0
 
-        self.pattern_matches = []
-        for i, color in enumerate(self.ramp_colors):
+    def _compute_matches(self, colors):
+        out = []
+        for i, color in enumerate(colors):
             if i < len(self.motif_pattern):
-                self.pattern_matches.append(color == self.motif_pattern[i])
+                out.append(color == self.motif_pattern[i])
             else:
-                self.pattern_matches.append(False)
+                out.append(False)
+        return out
+
+    def lock_pattern(self, ramp_colors_by_position):
+        """Snapshot the ramp colors and freeze the pattern. Called by
+        app.py at end-of-AUTO and end-of-TELEOP transitions so the
+        displayed pattern reflects the period's final state and stops
+        wiggling with live detections."""
+        self.ramp_colors = list(ramp_colors_by_position)[:9]
+        self.pattern_matches = self._compute_matches(self.ramp_colors)
+        self._pattern_locked = True
+
+    def unlock_pattern(self):
+        """Allow live-pattern updates to resume (used on full reset)."""
+        self._pattern_locked = False
 
     def get_scores(self):
         pattern_match_count = sum(1 for m in self.pattern_matches if m)

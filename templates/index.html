@@ -548,6 +548,30 @@
         .score-card .value.classified { color: #2dd; }
         .score-card .value.pattern    { color: #ffd700; }
 
+        /* Replay speed control row inside MATCH FOOTAGE */
+        .replay-speed-row { display: flex; align-items: center; gap: 6px; margin-top: 10px; }
+        .replay-speed-label { font-size: 0.65rem; color: #888; letter-spacing: 0.5px; margin-right: 4px; }
+        .replay-speed-current { font-size: 0.7rem; color: #2dd; margin-left: 6px; font-family: ui-monospace, Menlo, monospace; }
+
+        /* Tripwire debug panel */
+        .trip-debug-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-top: 8px; }
+        .trip-debug-col { background: #14182a; border-radius: 4px; padding: 6px; }
+        .trip-debug-head { font-size: 0.7rem; font-weight: 700; letter-spacing: 0.5px; margin-bottom: 4px; }
+        .trip-debug-section { margin-bottom: 6px; }
+        .trip-debug-zone { font-size: 0.65rem; color: #aaa; padding: 2px 4px; border-bottom: 1px solid #2a2f4a; margin-bottom: 2px; }
+        .trip-debug-zone .trip-cnt { color: #2dd; font-weight: 700; margin-left: 2px; }
+        .trip-debug-zone .trip-act { color: #ddd; margin-left: 2px; }
+        .trip-debug-events { font-family: ui-monospace, Menlo, monospace; font-size: 0.6rem; line-height: 1.25; max-height: 110px; overflow-y: auto; color: #888; }
+        .trip-debug-events .ev { padding: 1px 4px; border-left: 2px solid transparent; }
+        .trip-debug-events .ev.new      { border-color: #2dd; color: #cfd; }
+        .trip-debug-events .ev.matched  { border-color: #ff8c00; color: #fb8; }
+        .trip-debug-events .ev.retired  { border-color: #555; color: #777; }
+        .trip-debug-legend { font-size: 0.6rem; color: #888; margin-top: 6px; display: flex; gap: 10px; flex-wrap: wrap; }
+        .trip-debug-legend .dot { display: inline-block; width: 8px; height: 8px; border-radius: 2px; margin-right: 3px; vertical-align: middle; }
+        .trip-debug-legend .dot-new { background: #2dd; }
+        .trip-debug-legend .dot-matched { background: #ff8c00; }
+        .trip-debug-legend .dot-retired { background: #555; }
+
         .tuning-card { margin-top: 10px; }
         .tuner-row { margin: 8px 0 12px; }
         .tuner-row label {
@@ -647,6 +671,13 @@
                             <div class="match-list" id="match-list">
                                 <span class="match-none">Loading...</span>
                             </div>
+                            <div class="replay-speed-row">
+                                <span class="replay-speed-label">PLAYBACK</span>
+                                <button class="roi-btn" onclick="adjustReplaySpeed(0.5)" title="Halve playback speed">½×</button>
+                                <button class="roi-btn" onclick="setReplaySpeed(15)" title="Reset to 15 fps (default)">1×</button>
+                                <button class="roi-btn" onclick="adjustReplaySpeed(2.0)" title="Double playback speed">2×</button>
+                                <span class="replay-speed-current" id="replay-speed-current">15 fps</span>
+                            </div>
                             <div style="margin-top:10px; font-size:0.72rem; color:#666;" id="replay-status">
                                 Select a clip, draw your zones, then click START MATCH.
                             </div>
@@ -679,22 +710,44 @@
                         </div>
                     </details>
 
-                    <details class="collapsible">
-                        <summary>YOLO DETECTION SETTINGS</summary>
+                    <details class="collapsible" open>
+                        <summary>TRIPWIRE TUNING + DEBUG</summary>
                         <div class="detail-body">
                             <div class="param-row">
-                                <label>Confidence</label>
-                                <input type="range" min="5" max="95" step="5" id="yolo-conf"
-                                       oninput="updateYoloVal(this); pushYoloConfig()" value="40">
-                                <span class="param-val" id="yolo-conf-val">0.40</span>
+                                <label title="Velocity-projected matching radius. A new detection within this many pixels of a track's predicted position counts as the same ball (no new count). Smaller = more counts (potential over-count). Larger = fewer counts (potential under-count). Aim for ~1 ball diameter.">Trip radius (px)</label>
+                                <input type="range" min="5" max="200" step="5" id="tune-trip-radius"
+                                       oninput="updateRawVal(this); pushTuning()" value="40">
+                                <span class="param-val" id="tune-trip-radius-val">40</span>
                             </div>
-                            <div class="param-row">
-                                <label>IOU Threshold</label>
-                                <input type="range" min="5" max="95" step="5" id="yolo-iou"
-                                       oninput="updateYoloVal(this); pushYoloConfig()" value="45">
-                                <span class="param-val" id="yolo-iou-val">0.45</span>
+                            <div class="trip-debug-grid">
+                                <div class="trip-debug-col">
+                                    <div class="trip-debug-head" style="color:#e94560;">RED</div>
+                                    <div class="trip-debug-section" id="trip-dbg-red-gate">
+                                        <div class="trip-debug-zone">gate · count <span class="trip-cnt">0</span> · active <span class="trip-act">0</span></div>
+                                        <div class="trip-debug-events"></div>
+                                    </div>
+                                    <div class="trip-debug-section" id="trip-dbg-red-overflow">
+                                        <div class="trip-debug-zone">overflow · count <span class="trip-cnt">0</span> · active <span class="trip-act">0</span></div>
+                                        <div class="trip-debug-events"></div>
+                                    </div>
+                                </div>
+                                <div class="trip-debug-col">
+                                    <div class="trip-debug-head" style="color:#7a8eff;">BLUE</div>
+                                    <div class="trip-debug-section" id="trip-dbg-blue-gate">
+                                        <div class="trip-debug-zone">gate · count <span class="trip-cnt">0</span> · active <span class="trip-act">0</span></div>
+                                        <div class="trip-debug-events"></div>
+                                    </div>
+                                    <div class="trip-debug-section" id="trip-dbg-blue-overflow">
+                                        <div class="trip-debug-zone">overflow · count <span class="trip-cnt">0</span> · active <span class="trip-act">0</span></div>
+                                        <div class="trip-debug-events"></div>
+                                    </div>
+                                </div>
                             </div>
-                            <div class="detection-info" id="detection-info">Model: loading...</div>
+                            <div class="trip-debug-legend">
+                                <span><span class="dot dot-new"></span> new = count fired</span>
+                                <span><span class="dot dot-matched"></span> matched = continuation, no count</span>
+                                <span><span class="dot dot-retired"></span> retired = track aged out</span>
+                            </div>
                         </div>
                     </details>
                 </div>
@@ -708,15 +761,15 @@
                             Click to place points tracing the shape (min 3). Double-click, right-click, or Enter to finish. ESC to cancel.
                         </p>
                         <div class="draw-buttons">
-                            <button class="roi-btn" id="btn-red-roi"      onclick="startDrawMode('red-roi')"      style="border-color:#e94560;color:#e94560;">Red ROI</button>
-                            <button class="roi-btn" id="btn-red-gate"     onclick="startDrawMode('red-gate')"     style="border-color:#ff8c00;color:#ff8c00;">Red Gate</button>
-                            <button class="roi-btn" id="btn-red-exit"     onclick="startDrawMode('red-exit')"     style="border-color:#ffd700;color:#ffd700;">Red Exit</button>
-                            <button class="roi-btn" id="btn-red-divider"  onclick="startDrawMode('red-divider')"  style="border-color:#ffb347;color:#ffb347;">Red Divider</button>
-                            <button class="roi-btn" id="btn-blue-roi"     onclick="startDrawMode('blue-roi')"     style="border-color:#4560e9;color:#7a8eff;">Blue ROI</button>
-                            <button class="roi-btn" id="btn-blue-gate"    onclick="startDrawMode('blue-gate')"    style="border-color:#00bcd4;color:#00bcd4;">Blue Gate</button>
-                            <button class="roi-btn" id="btn-blue-exit"    onclick="startDrawMode('blue-exit')"    style="border-color:#ffeb7f;color:#ffeb7f;">Blue Exit</button>
-                            <button class="roi-btn" id="btn-blue-divider" onclick="startDrawMode('blue-divider')" style="border-color:#7fd8ff;color:#7fd8ff;">Blue Divider</button>
-                            <button class="roi-btn" id="btn-clear-roi"    onclick="clearROI()">Clear All</button>
+                            <button class="roi-btn" id="btn-red-roi"           onclick="startDrawMode('red-roi')"           style="border-color:#e94560;color:#e94560;">Red ROI</button>
+                            <button class="roi-btn" id="btn-red-gate-trip"     onclick="startDrawMode('red-gate-trip')"     style="border-color:#ffb700;color:#ffb700;">Red Gate-Trip</button>
+                            <button class="roi-btn" id="btn-red-overflow-trip" onclick="startDrawMode('red-overflow-trip')" style="border-color:#00bcd4;color:#00bcd4;">Red Overflow-Trip</button>
+                            <button class="roi-btn" id="btn-blue-roi"          onclick="startDrawMode('blue-roi')"          style="border-color:#4560e9;color:#7a8eff;">Blue ROI</button>
+                            <button class="roi-btn" id="btn-blue-gate-trip"    onclick="startDrawMode('blue-gate-trip')"    style="border-color:#ffd700;color:#ffd700;">Blue Gate-Trip</button>
+                            <button class="roi-btn" id="btn-blue-overflow-trip" onclick="startDrawMode('blue-overflow-trip')" style="border-color:#7fd8ff;color:#7fd8ff;">Blue Overflow-Trip</button>
+                            <button class="roi-btn" id="btn-clear-roi"         onclick="clearROI()">Clear All</button>
+                        </div>
+                        <div class="draw-buttons" style="margin-top:8px;">
                         </div>
                         <div class="roi-status" id="roi-status">Red: not set | Blue: not set</div>
                     </div>
@@ -833,59 +886,14 @@
                     </div>
                 </div>
 
-                <!-- Live tracker tuning panel. Shared across both alliances. -->
                 <div class="card tuning-card">
-                    <div class="card-head"><span>TRACKER TUNING</span>
-                        <span class="hint" style="font-weight:normal;color:#9aa;float:right;">live · changes apply to both alliances</span>
+                    <div class="card-head">
+                        <span>SCORING LOG</span>
+                        <span class="hint" style="font-weight:normal;color:#9aa;float:right;">live score & exit events</span>
                     </div>
                     <div class="card-body">
-                        <div class="tuner-row">
-                            <label for="tune-overflow-start">
-                                Overflow start (gate→exit fraction)
-                                <span class="tuner-val" id="tune-overflow-start-val">0.33</span>
-                            </label>
-                            <input type="range" id="tune-overflow-start" min="0" max="1" step="0.01" value="0.33">
-                            <div class="tuner-hint">Overflow only counts balls past this fraction of the gate→exit axis. Higher = stricter.</div>
-                        </div>
-                        <div class="tuner-row">
-                            <label for="tune-pass-radius">
-                                Pass-match radius
-                                <span class="tuner-val" id="tune-pass-radius-val">0.30</span>
-                            </label>
-                            <input type="range" id="tune-pass-radius" min="0.05" max="0.6" step="0.01" value="0.30">
-                            <div class="tuner-hint">Frame-to-frame match distance for the same rolling ball. Bigger = tolerates faster motion; smaller = separates two close balls.</div>
-                        </div>
-                        <div class="tuner-row">
-                            <label for="tune-pass-gap">
-                                Pass-end gap (frames)
-                                <span class="tuner-val" id="tune-pass-gap-val">8</span>
-                            </label>
-                            <input type="range" id="tune-pass-gap" min="1" max="30" step="1" value="8">
-                            <div class="tuner-hint">How long a pass waits for YOLO drops before being committed to overflow.</div>
-                        </div>
-                        <div class="tuner-row">
-                            <label for="tune-pass-min">
-                                Pass-min frames
-                                <span class="tuner-val" id="tune-pass-min-val">1</span>
-                            </label>
-                            <input type="range" id="tune-pass-min" min="1" max="10" step="1" value="1">
-                            <div class="tuner-hint">Minimum frames a pass must span to count. Raise to ignore 1-frame noise.</div>
-                        </div>
-                        <div class="tuner-row">
-                            <label for="tune-post-commit">
-                                Post-commit lockout (frames)
-                                <span class="tuner-val" id="tune-post-commit-val">20</span>
-                            </label>
-                            <input type="range" id="tune-post-commit" min="0" max="60" step="1" value="20">
-                            <div class="tuner-hint">After a pass is counted, suppress a new pass near its last position for this many frames. Raise if one ball is counted twice at the end of its roll.</div>
-                        </div>
-                        <div class="tuner-row">
-                            <label for="tune-smoothing">
-                                Count smoothing window (frames)
-                                <span class="tuner-val" id="tune-smoothing-val">15</span>
-                            </label>
-                            <input type="range" id="tune-smoothing" min="1" max="60" step="1" value="15">
-                            <div class="tuner-hint">Median window for the live Classified count. Bigger = steadier but slower to respond.</div>
+                        <div id="score-event-log" style="max-height:280px;overflow-y:auto;font-family:monospace;font-size:0.78rem;">
+                            <div style="color:#666;text-align:center;padding:8px;">No events yet</div>
                         </div>
                     </div>
                 </div>
@@ -1011,7 +1019,7 @@
                 sp.className = 'status-pill offline';
             });
         }
-        setInterval(updateScores, 500);
+        setInterval(updateScores, 1500);
         updateScores();
 
         // ============= MATCH STATE =============
@@ -1119,7 +1127,7 @@
                 }
             }).catch(() => {});
         }
-        setInterval(pollMatchState, 250);
+        setInterval(pollMatchState, 1000);
         pollMatchState();
 
         function startMatch() {
@@ -1143,113 +1151,213 @@
                 }).catch(e => console.warn('Reset failed:', e));
         }
 
-        // ============= YOLO TUNING =============
-        let yoloPushTimer = null;
-        function updateYoloVal(el) {
-            const val = (el.value / 100).toFixed(2);
-            document.getElementById(el.id + '-val').textContent = val;
+        // ============= TRIPWIRE TUNING + DEBUG =============
+        function updateRawVal(el) {
+            document.getElementById(el.id + '-val').textContent = el.value;
         }
-        function loadYoloConfig() {
-            fetch('/api/yolo_config').then(r => r.json()).then(c => {
-                const conf = document.getElementById('yolo-conf');
-                conf.value = Math.round(c.confidence * 100);
-                document.getElementById('yolo-conf-val').textContent = c.confidence.toFixed(2);
-                const iou = document.getElementById('yolo-iou');
-                iou.value = Math.round(c.iou_threshold * 100);
-                document.getElementById('yolo-iou-val').textContent = c.iou_threshold.toFixed(2);
-                document.getElementById('detection-info').textContent = 'Model: ' + c.model_path;
-            }).catch(() => {});
-        }
-        function pushYoloConfig() {
-            if (yoloPushTimer) clearTimeout(yoloPushTimer);
-            yoloPushTimer = setTimeout(() => {
+
+        // Initial load — read the current radius from the server
+        fetch('/api/yolo_config').then(r => r.json()).then(c => {
+            const tr = document.getElementById('tune-trip-radius');
+            if (tr && c.tripwire_match_radius_px != null) {
+                tr.value = c.tripwire_match_radius_px;
+                document.getElementById('tune-trip-radius-val').textContent = c.tripwire_match_radius_px;
+            }
+        }).catch(() => {});
+
+        let tuningPushTimer = null;
+        function pushTuning() {
+            if (tuningPushTimer) clearTimeout(tuningPushTimer);
+            tuningPushTimer = setTimeout(() => {
                 fetch('/api/yolo_config', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({
-                        confidence:    +document.getElementById('yolo-conf').value / 100,
-                        iou_threshold: +document.getElementById('yolo-iou').value / 100,
+                        tripwire_match_radius_px: +document.getElementById('tune-trip-radius').value,
                     })
                 });
-            }, 100);
+            }, 150);
         }
-        loadYoloConfig();
 
-        // ============= TRACKER TUNING SLIDERS =============
-        const TUNER_MAP = {
-            'tune-overflow-start': { key: 'overflow_start_fraction', fmt: v => (+v).toFixed(2) },
-            'tune-pass-radius':    { key: 'pass_match_radius_norm',  fmt: v => (+v).toFixed(2) },
-            'tune-pass-gap':       { key: 'pass_gap_frames',         fmt: v => String(+v) },
-            'tune-pass-min':       { key: 'pass_min_frames',         fmt: v => String(+v) },
-            'tune-post-commit':    { key: 'post_commit_lockout_frames', fmt: v => String(+v) },
-            'tune-smoothing':      { key: 'smoothing_window',        fmt: v => String(+v) },
+        // ----- Debug poller -----
+        // Tracks the last seq we've seen per (alliance, zone) so the API
+        // returns only new events. Renders an event tail so you can see
+        // exactly what each tripwire decided each frame.
+        const _tripDebugSeqs = { red: { gate: 0, overflow: 0 }, blue: { gate: 0, overflow: 0 } };
+        const _tripDebugBuf  = {
+            red:  { gate: [], overflow: [] },
+            blue: { gate: [], overflow: [] },
         };
+        const TRIP_DEBUG_MAX = 30;
 
-        function tunerKeyById(id) { return (TUNER_MAP[id] || {}).key; }
-
-        let _tunerPostTimer = null;
-        const _tunerPending = {};
-        function pushTunerValue(key, value) {
-            _tunerPending[key] = value;
-            if (_tunerPostTimer) clearTimeout(_tunerPostTimer);
-            _tunerPostTimer = setTimeout(() => {
-                const payload = Object.assign({}, _tunerPending);
-                Object.keys(_tunerPending).forEach(k => delete _tunerPending[k]);
-                _tunerPostTimer = null;
-                fetch('/api/tracker/params', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify(payload),
-                }).catch(e => console.warn('Tracker param push failed:', e));
-            }, 120);
+        function _tripDbgEl(alliance, zone) {
+            return document.getElementById('trip-dbg-' + alliance + '-' + zone);
+        }
+        function renderTripEvents(alliance, zone, count, activeCount) {
+            const root = _tripDbgEl(alliance, zone);
+            if (!root) return;
+            root.querySelector('.trip-cnt').textContent = count;
+            root.querySelector('.trip-act').textContent = activeCount;
+            const evRoot = root.querySelector('.trip-debug-events');
+            const buf = _tripDebugBuf[alliance][zone];
+            evRoot.innerHTML = buf.slice(-TRIP_DEBUG_MAX).reverse().map(e => {
+                let line;
+                if (e.kind === 'new') {
+                    const near = (e.nearest_dist != null)
+                        ? ` (nearest #${e.nearest_tid} ${e.nearest_dist}px > r${e.radius})`
+                        : ` (no other tracks)`;
+                    line = `f${e.frame} NEW #${e.tid} ${e.color||'?'} @${e.pos[0]},${e.pos[1]}` + near + ` → cnt=${e.count}`;
+                } else if (e.kind === 'matched') {
+                    line = `f${e.frame} match #${e.tid} ${e.color||'?'} d=${e.dist}/${e.radius}px @${e.pos[0]},${e.pos[1]}`;
+                } else if (e.kind === 'retired') {
+                    line = `f${e.frame} retired #${e.tid} ${e.color||'?'} (last @${e.last_pos[0]},${e.last_pos[1]})`;
+                } else {
+                    line = JSON.stringify(e);
+                }
+                return `<div class="ev ${e.kind}">${line}</div>`;
+            }).join('');
         }
 
-        function initTrackerTuners() {
-            Object.keys(TUNER_MAP).forEach(id => {
-                const input = document.getElementById(id);
-                const valEl = document.getElementById(id + '-val');
-                if (!input || !valEl) return;
-                const spec = TUNER_MAP[id];
-                input.addEventListener('input', () => {
-                    valEl.textContent = spec.fmt(input.value);
-                    pushTunerValue(spec.key, input.value);
-                });
-            });
-            // Pull server-side values to initialize slider positions.
-            fetch('/api/tracker/params').then(r => r.json()).then(d => {
-                Object.keys(TUNER_MAP).forEach(id => {
-                    const input = document.getElementById(id);
-                    const valEl = document.getElementById(id + '-val');
-                    if (!input || !valEl) return;
-                    const spec = TUNER_MAP[id];
-                    if (d[spec.key] !== undefined) {
-                        input.value = d[spec.key];
-                        valEl.textContent = spec.fmt(d[spec.key]);
+        function pollTripwireDebug() {
+            const qs = [
+                'since_red_gate=' + _tripDebugSeqs.red.gate,
+                'since_red_overflow=' + _tripDebugSeqs.red.overflow,
+                'since_blue_gate=' + _tripDebugSeqs.blue.gate,
+                'since_blue_overflow=' + _tripDebugSeqs.blue.overflow,
+            ].join('&');
+            fetch('/api/tripwire_debug?' + qs)
+              .then(r => r.json())
+              .then(data => {
+                  for (const alliance of ['red','blue']) {
+                      const a = data[alliance];
+                      if (!a) continue;
+                      for (const zone of ['gate','overflow']) {
+                          const z = a[zone];
+                          if (!z) continue;
+                          const buf = _tripDebugBuf[alliance][zone];
+                          for (const e of (z.events || [])) {
+                              buf.push(e);
+                              if (e.seq > _tripDebugSeqs[alliance][zone]) {
+                                  _tripDebugSeqs[alliance][zone] = e.seq;
+                              }
+                          }
+                          while (buf.length > TRIP_DEBUG_MAX * 2) buf.shift();
+                          renderTripEvents(alliance, zone, z.count, (z.active || []).length);
+                      }
+                  }
+              })
+              .catch(() => {});
+        }
+        setInterval(pollTripwireDebug, 250);
+        pollTripwireDebug();
+
+
+        // ============= SCORING LOG (combined score + exit events) =============
+        let _lastSeenExitFrame = 0;
+        let _lastSeenScoreId = 0;
+        const _eventBuffer = []; // unified buffer
+        const MAX_DISPLAYED_EVENTS = 40;
+
+        function fmtTime(t) {
+            const d = new Date(t * 1000);
+            return d.toTimeString().slice(0, 8);
+        }
+
+        function renderEventLog() {
+            const el = document.getElementById('score-event-log');
+            if (!el) return;
+            if (_eventBuffer.length === 0) {
+                el.innerHTML = '<div style="color:#666;text-align:center;padding:8px;">No events yet</div>';
+                return;
+            }
+            const items = _eventBuffer.slice(-MAX_DISPLAYED_EVENTS).slice().sort((a, b) => b.t - a.t);
+            el.innerHTML = items.map(ev => {
+                const allianceStyle = ev.alliance === 'red' ? 'color:#e94560' : 'color:#7a8eff';
+                const time = '<span style="color:#888;">' + fmtTime(ev.t) + '</span> ';
+                const alliance = '<span style="' + allianceStyle + ';font-weight:700;">' + ev.alliance.toUpperCase() + '</span> ';
+                if (ev.kind === 'exit') {
+                    const colorTxt = ev.color === 'G' ? 'GREEN'
+                                   : ev.color === 'P' ? 'PURPLE' : '?';
+                    const colorStyle = ev.color === 'G' ? 'color:#3c3'
+                                     : ev.color === 'P' ? 'color:#c3c' : 'color:#888';
+                    return '<div style="padding:3px 6px;border-bottom:1px solid #222;">'
+                         + time + alliance
+                         + '<span style="' + colorStyle + ';">' + colorTxt + '</span> '
+                         + '<span style="color:#aaa;">exited</span></div>';
+                }
+                // score event
+                const sign = '<span style="color:#0f0;font-weight:700;">+' + ev.points + '</span> ';
+                const lblColor = ev.label === 'classified' ? '#2dd'
+                               : ev.label === 'pattern' ? '#ffd700' : '#ff8c00';
+                const lbl = '<span style="color:' + lblColor + ';">' + ev.label + '</span>';
+                const cnt = ev.count > 1 ? ' <span style="color:#888;">(x' + ev.count + ')</span>' : '';
+                return '<div style="padding:3px 6px;border-bottom:1px solid #222;">'
+                     + time + alliance + sign + lbl + cnt + '</div>';
+            }).join('');
+        }
+
+        function pushEvents(newEvents) {
+            newEvents.forEach(e => _eventBuffer.push(e));
+            if (_eventBuffer.length > MAX_DISPLAYED_EVENTS * 2) {
+                _eventBuffer.splice(0, _eventBuffer.length - MAX_DISPLAYED_EVENTS * 2);
+            }
+            renderEventLog();
+        }
+
+        function pollLogEvents() {
+            fetch('/api/exit_events?since=' + _lastSeenExitFrame)
+                .then(r => r.json())
+                .then(d => {
+                    if (d.events && d.events.length) {
+                        const tagged = d.events.map(e => Object.assign({kind: 'exit'}, e));
+                        d.events.forEach(ev => {
+                            if (ev.frame > _lastSeenExitFrame) _lastSeenExitFrame = ev.frame;
+                        });
+                        pushEvents(tagged);
                     }
-                });
-            }).catch(e => console.warn('Tracker params load failed:', e));
+                }).catch(e => {});
+            fetch('/api/score_events?since=' + _lastSeenScoreId)
+                .then(r => r.json())
+                .then(d => {
+                    if (d.events && d.events.length) {
+                        const tagged = d.events.map(e => Object.assign({kind: 'score'}, e));
+                        d.events.forEach(ev => {
+                            if (ev.id > _lastSeenScoreId) _lastSeenScoreId = ev.id;
+                        });
+                        pushEvents(tagged);
+                    }
+                }).catch(e => {});
         }
-        initTrackerTuners();
+        renderEventLog();
+        setInterval(pollLogEvents, 1000);
 
         // ============= ROI DRAWING (polygon) =============
-        let redROI = null, redGate = null, redExit = null, redDivider = null;
-        let blueROI = null, blueGate = null, blueExit = null, blueDivider = null;
+        let redROI = null, redGateTrip = null, redOverflowTrip = null;
+        let blueROI = null, blueGateTrip = null, blueOverflowTrip = null;
         let roiDrawMode = null;
         let drawPoints = [];
         let mousePos = null;
         let roiCanvas, roiCtx, rawFeedImg, rawFeedCard;
 
         const DRAW_MODE_COLORS = {
-            'red-roi': '#e94560', 'red-gate': '#ff8c00', 'red-exit': '#ffd700', 'red-divider': '#ffb347',
-            'blue-roi': '#4560e9', 'blue-gate': '#00bcd4', 'blue-exit': '#ffeb7f', 'blue-divider': '#7fd8ff'
+            'red-roi':            '#e94560',
+            'red-gate-trip':      '#ffb700',
+            'red-overflow-trip':  '#00bcd4',
+            'blue-roi':           '#4560e9',
+            'blue-gate-trip':     '#ffd700',
+            'blue-overflow-trip': '#7fd8ff'
         };
         const DRAW_MODE_LABELS = {
-            'red-roi': 'RED ROI', 'red-gate': 'RED GATE', 'red-exit': 'RED EXIT', 'red-divider': 'RED DIVIDER',
-            'blue-roi': 'BLUE ROI', 'blue-gate': 'BLUE GATE', 'blue-exit': 'BLUE EXIT', 'blue-divider': 'BLUE DIVIDER'
+            'red-roi':            'RED ROI',
+            'red-gate-trip':      'RED GATE-TRIP',
+            'red-overflow-trip':  'RED OVERFLOW-TRIP',
+            'blue-roi':           'BLUE ROI',
+            'blue-gate-trip':     'BLUE GATE-TRIP',
+            'blue-overflow-trip': 'BLUE OVERFLOW-TRIP'
         };
-        function isDividerMode(m) { return m === 'red-divider' || m === 'blue-divider'; }
-        function maxPointsForMode(m) { return isDividerMode(m) ? 2 : 999; }
-        function minPointsForMode(m) { return isDividerMode(m) ? 2 : 3; }
+        // No special divider mode — every shape is a polygon now (min 3 pts).
+        function maxPointsForMode(m) { return 999; }
+        function minPointsForMode(m) { return 3; }
 
         function roiInit() {
             roiCanvas = document.getElementById('roi-canvas');
@@ -1324,12 +1432,12 @@
         }
 
         function clearAllDrawButtons() {
-            ['btn-red-roi','btn-red-gate','btn-red-exit','btn-red-divider',
-             'btn-blue-roi','btn-blue-gate','btn-blue-exit','btn-blue-divider'].forEach(id => {
+            ['btn-red-roi','btn-red-gate-trip','btn-red-overflow-trip',
+             'btn-blue-roi','btn-blue-gate-trip','btn-blue-overflow-trip'].forEach(id => {
                 const b = document.getElementById(id);
                 if (b) b.classList.remove('active-draw',
-                    'red-roi-active','red-gate-active','red-exit-active','red-divider-active',
-                    'blue-roi-active','blue-gate-active','blue-exit-active','blue-divider-active');
+                    'red-roi-active','red-gate-trip-active','red-overflow-trip-active',
+                    'blue-roi-active','blue-gate-trip-active','blue-overflow-trip-active');
             });
         }
 
@@ -1414,19 +1522,13 @@
             const pts = drawPoints.slice();
             const min = minPointsForMode(mode);
             if (pts.length < min) { cancelDraw(); return; }
-            if (isDividerMode(mode)) {
-                const line = pts.slice(0, 2);
-                if (mode === 'red-divider') redDivider = line;
-                else if (mode === 'blue-divider') blueDivider = line;
-            } else {
-                const poly = pts;
-                if (mode === 'red-roi') redROI = poly;
-                else if (mode === 'red-gate') redGate = poly;
-                else if (mode === 'red-exit') redExit = poly;
-                else if (mode === 'blue-roi') blueROI = poly;
-                else if (mode === 'blue-gate') blueGate = poly;
-                else if (mode === 'blue-exit') blueExit = poly;
-            }
+            const poly = pts;
+            if      (mode === 'red-roi')            redROI = poly;
+            else if (mode === 'red-gate-trip')      redGateTrip = poly;
+            else if (mode === 'red-overflow-trip')  redOverflowTrip = poly;
+            else if (mode === 'blue-roi')           blueROI = poly;
+            else if (mode === 'blue-gate-trip')     blueGateTrip = poly;
+            else if (mode === 'blue-overflow-trip') blueOverflowTrip = poly;
             roiDrawMode = null;
             drawPoints = [];
             mousePos = null;
@@ -1504,14 +1606,12 @@
                 roiCtx.globalCompositeOperation = 'source-over';
             }
 
-            drawPolygonOverlay(redROI,   '#e94560', 'RED ROI');
-            drawPolygonOverlay(redGate,  '#ff8c00', 'RED GATE');
-            drawPolygonOverlay(redExit,  '#ffd700', 'RED EXIT');
-            drawPolygonOverlay(blueROI,  '#4560e9', 'BLUE ROI');
-            drawPolygonOverlay(blueGate, '#00bcd4', 'BLUE GATE');
-            drawPolygonOverlay(blueExit, '#ffeb7f', 'BLUE EXIT');
-            drawDividerLine(redDivider,  '#ffb347', 'RED DIV');
-            drawDividerLine(blueDivider, '#7fd8ff', 'BLUE DIV');
+            drawPolygonOverlay(redROI,           '#e94560', 'RED ROI');
+            drawPolygonOverlay(redGateTrip,      '#ffb700', 'RED GATE-TRIP');
+            drawPolygonOverlay(redOverflowTrip,  '#00bcd4', 'RED OVERFLOW-TRIP');
+            drawPolygonOverlay(blueROI,          '#4560e9', 'BLUE ROI');
+            drawPolygonOverlay(blueGateTrip,     '#ffd700', 'BLUE GATE-TRIP');
+            drawPolygonOverlay(blueOverflowTrip, '#7fd8ff', 'BLUE OVERFLOW-TRIP');
         }
 
         function drawDividerLine(line, color, label) {
@@ -1582,27 +1682,27 @@
 
         function updateROIStatusText() {
             const el = document.getElementById('roi-status');
-            function fmt(name, roi, gate, exitZ) {
+            function fmt(name, roi, gateTrip, ovrTrip) {
                 if (!roi) return name + ': not set';
                 let s = name + ' ROI (' + roi.length + 'pts)';
-                if (gate) s += ' + Gate (' + gate.length + 'pts)';
-                if (exitZ) s += ' + Exit (' + exitZ.length + 'pts)';
+                if (gateTrip) s += ' + GateTrip (' + gateTrip.length + 'pts)';
+                if (ovrTrip)  s += ' + OvrTrip (' + ovrTrip.length + 'pts)';
                 return s;
             }
-            el.textContent = fmt('Red', redROI, redGate, redExit)
-                + ' | ' + fmt('Blue', blueROI, blueGate, blueExit);
+            el.textContent = fmt('Red', redROI, redGateTrip, redOverflowTrip)
+                + ' | ' + fmt('Blue', blueROI, blueGateTrip, blueOverflowTrip);
         }
 
         function clearROI() {
-            redROI = null; redGate = null; redExit = null; redDivider = null;
-            blueROI = null; blueGate = null; blueExit = null; blueDivider = null;
+            redROI = null; redGateTrip = null; redOverflowTrip = null;
+            blueROI = null; blueGateTrip = null; blueOverflowTrip = null;
             cancelDraw();
             fetch('/api/roi', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({
-                    red:  { roi: null, gate: null, exit: null, divider: null },
-                    blue: { roi: null, gate: null, exit: null, divider: null }
+                    red:  { roi: null, gate_trip: null, overflow_trip: null },
+                    blue: { roi: null, gate_trip: null, overflow_trip: null }
                 })
             }).catch(e => console.warn('Clear ROI failed:', e));
         }
@@ -1612,8 +1712,8 @@
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({
-                    red:  { roi: redROI,  gate: redGate,  exit: redExit,  divider: redDivider  },
-                    blue: { roi: blueROI, gate: blueGate, exit: blueExit, divider: blueDivider }
+                    red:  { roi: redROI,  gate_trip: redGateTrip,  overflow_trip: redOverflowTrip },
+                    blue: { roi: blueROI, gate_trip: blueGateTrip, overflow_trip: blueOverflowTrip }
                 })
             }).catch(e => console.warn('Save ROI failed:', e));
         }
@@ -1629,28 +1729,15 @@
 
         function loadROI() {
             fetch('/api/roi').then(r => r.json()).then(d => {
-                if (d.red !== undefined || d.blue !== undefined) {
-                    if (d.red)  {
-                        redROI     = loadPolyOrRect(d.red.roi);
-                        redGate    = loadPolyOrRect(d.red.gate);
-                        redExit    = loadPolyOrRect(d.red.exit);
-                        redDivider = (Array.isArray(d.red.divider) && d.red.divider.length === 2) ? d.red.divider : null;
-                    }
-                    if (d.blue) {
-                        blueROI     = loadPolyOrRect(d.blue.roi);
-                        blueGate    = loadPolyOrRect(d.blue.gate);
-                        blueExit    = loadPolyOrRect(d.blue.exit);
-                        blueDivider = (Array.isArray(d.blue.divider) && d.blue.divider.length === 2) ? d.blue.divider : null;
-                    }
-                } else {
-                    if (d.roi && d.roi.length === 4 && typeof d.roi[0] === 'number') {
-                        const r = d.roi;
-                        redROI = [[r[0], r[1]], [r[2], r[1]], [r[2], r[3]], [r[0], r[3]]];
-                    }
-                    if (d.gate && d.gate.length === 4 && typeof d.gate[0] === 'number') {
-                        const r = d.gate;
-                        redGate = [[r[0], r[1]], [r[2], r[1]], [r[2], r[3]], [r[0], r[3]]];
-                    }
+                if (d.red)  {
+                    redROI          = loadPolyOrRect(d.red.roi);
+                    redGateTrip     = loadPolyOrRect(d.red.gate_trip);
+                    redOverflowTrip = loadPolyOrRect(d.red.overflow_trip);
+                }
+                if (d.blue) {
+                    blueROI          = loadPolyOrRect(d.blue.roi);
+                    blueGateTrip     = loadPolyOrRect(d.blue.gate_trip);
+                    blueOverflowTrip = loadPolyOrRect(d.blue.overflow_trip);
                 }
                 drawOverlays();
                 updateROIStatusText();
@@ -1712,6 +1799,10 @@
                 const slider = document.getElementById('scrub-slider');
                 const curLbl = document.getElementById('scrub-current');
                 const totLbl = document.getElementById('scrub-total');
+                const speedLbl = document.getElementById('replay-speed-current');
+                if (speedLbl && d.playback_fps != null) {
+                    speedLbl.textContent = d.playback_fps + ' fps';
+                }
                 if (!bar || !slider) return;
 
                 // Only show scrub bar when replay mode is active (has a current video)
@@ -1726,6 +1817,27 @@
                 } else {
                     bar.style.display = 'none';
                 }
+            }).catch(() => {});
+        }
+
+        function adjustReplaySpeed(mult) {
+            fetch('/api/replay/speed', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ mult: mult })
+            }).then(r => r.json()).then(d => {
+                const el = document.getElementById('replay-speed-current');
+                if (el && d.playback_fps != null) el.textContent = d.playback_fps + ' fps';
+            }).catch(() => {});
+        }
+        function setReplaySpeed(fps) {
+            fetch('/api/replay/speed', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ fps: fps })
+            }).then(r => r.json()).then(d => {
+                const el = document.getElementById('replay-speed-current');
+                if (el && d.playback_fps != null) el.textContent = d.playback_fps + ' fps';
             }).catch(() => {});
         }
 
@@ -1754,7 +1866,7 @@
         })();
 
         // Poll replay status regularly (updates the scrub slider position)
-        setInterval(pollReplayStatus, 500);
+        setInterval(pollReplayStatus, 2000);
         pollReplayStatus();
 
         // Hide scrub bar once match has started (during AUTO/TELEOP/ENDED)

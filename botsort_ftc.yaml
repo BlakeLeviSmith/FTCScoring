@@ -1,0 +1,46 @@
+# BoT-SORT tuned for FTC ball detection — moving balls have weaker
+# YOLO confidence than the COCO-class objects BoT-SORT defaults are
+# calibrated for, and brief detection drops were causing the same
+# physical ball to get new track_ids (which broke our exit-zone
+# in-zone-count and track-lifetime gates).
+#
+# Compared to ultralytics' stock botsort.yaml:
+#   - lower thresholds so weak-confidence detections still feed tracks
+#   - longer track_buffer so a lost track survives multi-frame drops
+#   - higher match_thresh (more permissive Hungarian matching)
+#
+# Reference: https://docs.ultralytics.com/modes/track/#tracker-arguments
+tracker_type: botsort
+
+# Detection confidence required to participate in tracking.
+# COCO defaults: 0.5 / 0.1 / 0.6. Ours are aggressive but the upstream
+# YOLO_CONFIDENCE / per-class / position filters already gate quality.
+track_high_thresh: 0.30
+track_low_thresh:  0.05
+new_track_thresh:  0.35
+
+# Frames a track is kept alive after disappearing. At 15 FPS:
+#   30 = 2.0 s  (default)
+#   60 = 4.0 s  (chosen — survives a longer occlusion / detection gap)
+track_buffer: 60
+
+# IoU/distance threshold for Hungarian matching. Higher = more lenient.
+match_thresh: 0.85
+
+# Fuse detection confidence into the match score (default).
+fuse_score: True
+
+# Global motion compensation — sparseOptFlow is robust on
+# real-world video and the ESP32 stream tolerates it.
+gmc_method: sparseOptFlow
+
+# BoT-SORT-specific: proximity + appearance thresholds.
+# Loosened proximity helps re-bind a track that drifted slightly
+# during a gap.
+proximity_thresh: 0.5
+appearance_thresh: 0.25
+
+# Visual ReID (deep appearance features). Off — ultralytics' default
+# implementation is heavy and we get adequate motion-based ReID from
+# the Kalman filter already.
+with_reid: False

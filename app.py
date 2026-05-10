@@ -77,6 +77,9 @@ def _resolution_label(w, h):
         (1280, 1024): "SXGA",
         (1600, 1200): "UXGA",
         (1920, 1080): "FHD",
+        (2048, 1536): "QXGA",
+        (2560, 1440): "QHD",
+        (2592, 1944): "5MP",
         (640, 360): "nHD",
     }
     return table.get((w, h), f"{w}x{h}")
@@ -187,7 +190,7 @@ def save_roi_config(data):
         json.dump(data, f, indent=2)
 
 
-STREAM_TIMEOUT = (5, 30)
+STREAM_TIMEOUT = (5, 8)  # (connect, read) — 8s read timeout so crop reconnects faster
 RECONNECT_DELAY = 0.3
 esp32_configured = False
 
@@ -314,17 +317,32 @@ def configure_esp32_camera(force=False):
         esp32_configured = True
         return
 
-    try:
-        url = f"{config.ESP32_CONTROL_URL}?var=framesize&val={config.ESP32_DEFAULT_FRAMESIZE}"
-        resp = http_requests.get(url, timeout=3)
-        if resp.status_code == 200:
-            print(f"    Set framesize={config.ESP32_DEFAULT_FRAMESIZE} (SVGA 800x600)")
-            print("    Waiting for camera to stabilize...")
-            time.sleep(2)
-        else:
-            print(f"    [!] framesize returned {resp.status_code}")
-    except Exception as e:
-        print(f"    [!] Could not set framesize: {e}")
+    if config.ESP32_DEFAULT_FRAMESIZE is not None:
+        try:
+            url = f"{config.ESP32_CONTROL_URL}?var=framesize&val={config.ESP32_DEFAULT_FRAMESIZE}"
+            resp = http_requests.get(url, timeout=3)
+            if resp.status_code == 200:
+                print(f"    Set framesize={config.ESP32_DEFAULT_FRAMESIZE}")
+                print("    Waiting for camera to stabilize...")
+                time.sleep(2)
+            else:
+                print(f"    [!] framesize returned {resp.status_code}")
+        except Exception as e:
+            print(f"    [!] Could not set framesize: {e}")
+    else:
+        print("    Using firmware default framesize")
+        time.sleep(1)  # brief stabilization
+
+    # Flip image if configured (upside-down mounted camera)
+    if getattr(config, 'ESP32_FLIP_IMAGE', False):
+        try:
+            http_requests.get(
+                f"{config.ESP32_CONTROL_URL}?var=vflip&val=1", timeout=3)
+            http_requests.get(
+                f"{config.ESP32_CONTROL_URL}?var=hmirror&val=1", timeout=3)
+            print("    Set vflip=1 hmirror=1 (image flipped)")
+        except Exception:
+            print("    [!] Could not set flip/mirror")
 
     esp32_configured = True
 
@@ -358,21 +376,17 @@ def grab_loop():
         conn_monitor.record_reconnect()
         print("[+] MJPEG stream connected")
 
-        # Always push our framesize/quality settings after every (re)connect.
-        # If the ESP32 rebooted — e.g. after a fall or brief power loss — it
-        # comes back up in the firmware default (often lower-res/lower-quality)
-        # and we need to re-assert SVGA + our quality setting. Previously
-        # this ran once per process, so a post-crash reconnect silently
-        # left the camera in whatever degraded state it rebooted into.
-        global esp32_configured
-        esp32_configured = False
+        # Configure camera settings only on first connect. Re-configuring on
+        # every reconnect was thrashing the OV5640 (2s stabilization delay +
+        # stream tear-down on each cycle). Use /api/camera/reapply to force
+        # a reconfigure if the camera settings drifted after a power cycle.
         if first_connect:
             first_connect = False
-        try:
-            stream.close()
-        except Exception:
-            pass
-        configure_esp32_camera()
+            try:
+                stream.close()
+            except Exception:
+                pass
+            configure_esp32_camera()
         try:
             stream = http_requests.get(
                 config.ESP32_STREAM_URL, stream=True, timeout=STREAM_TIMEOUT,
@@ -535,10 +549,11 @@ _replay_src_fps = 30           # Source video FPS for time calculations
 
 
 def grab_loop_replay(video_path, target_fps=15, loop=True):
-    """Grab loop that replays a video file at native resolution.
+    """Grab loop that replays a video file, downscaled to live stream quality.
 
-    Uses the video's native resolution (no downscaling) with moderate JPEG
-    compression. For ESP32 simulation use --usb or the actual camera.
+    Frames larger than config.REPLAY_TARGET_HEIGHT are resized down preserving
+    aspect ratio so the YOLO model sees the same pixel density it gets from
+    the ESP32 stream. Smaller sources are passed through untouched.
     Supports runtime video switching via _replay_switch_to.
     """
     global latest_frame, latest_raw_jpg, frame_seq
@@ -574,9 +589,36 @@ def grab_loop_replay(video_path, target_fps=15, loop=True):
         _replay_total_frames = total
         _replay_src_fps = src_fps
         _replay_current_frame = 0
+
+        target_h = getattr(config, "REPLAY_TARGET_HEIGHT", 0) or 0
+        if target_h > 0 and src_h > target_h:
+            scale = target_h / float(src_h)
+            out_w = int(round(src_w * scale))
+            out_h = target_h
+            def _resize(f):
+                return cv2.resize(f, (out_w, out_h), interpolation=cv2.INTER_AREA)
+        else:
+            out_w, out_h = src_w, src_h
+            def _resize(f):
+                return f
+
+        # Read sim-compression settings INSIDE _scale on every frame so
+        # toggles from the UI take effect immediately without restart.
+        def _scale(f):
+            f = _resize(f)
+            if getattr(config, "REPLAY_SIMULATE_LIVE_COMPRESSION", False):
+                q = int(getattr(config, "REPLAY_SIM_JPEG_QUALITY", 60))
+                ok, buf = cv2.imencode(".jpg", f, [cv2.IMWRITE_JPEG_QUALITY, q])
+                if ok:
+                    f = cv2.imdecode(buf, cv2.IMREAD_COLOR)
+            return f
+
         print(f"[+] Replay: {os.path.basename(video_path)}")
         print(f"    Source: {src_w}x{src_h} @ {src_fps:.1f}fps, {total} frames")
-        print(f"    Output: native res @ {_replay_target_fps}fps")
+        sim_on = getattr(config, "REPLAY_SIMULATE_LIVE_COMPRESSION", False)
+        comp_note = (f", MJPEG-sim q={int(getattr(config, 'REPLAY_SIM_JPEG_QUALITY', 60))}"
+                     if sim_on else "")
+        print(f"    Output: {out_w}x{out_h} @ {_replay_target_fps}fps{comp_note}")
 
         last_time = time.time()
         grab_count = 0
@@ -584,6 +626,7 @@ def grab_loop_replay(video_path, target_fps=15, loop=True):
         # Show first frame immediately (even while paused)
         ret, first_frame = cap.read()
         if ret:
+            first_frame = _scale(first_frame)
             _replay_current_frame = 1
             _, jpg_buf = cv2.imencode(".jpg", first_frame, REPLAY_QUALITY)
             with frame_lock:
@@ -605,6 +648,7 @@ def grab_loop_replay(video_path, target_fps=15, loop=True):
                 cap.set(cv2.CAP_PROP_POS_FRAMES, target_frame)
                 ret, frame = cap.read()
                 if ret:
+                    frame = _scale(frame)
                     _replay_current_frame = target_frame + 1
                     _, jpg_buf = cv2.imencode(".jpg", frame, REPLAY_QUALITY)
                     with frame_lock:
@@ -622,9 +666,10 @@ def grab_loop_replay(video_path, target_fps=15, loop=True):
             ret, frame = cap.read()
             if not ret:
                 break
+            frame = _scale(frame)
             _replay_current_frame = int(cap.get(cv2.CAP_PROP_POS_FRAMES))
 
-            # Encode as JPEG for the raw feed (no downscaling)
+            # Encode as JPEG for the raw feed (already at live quality)
             _, jpg_buf = cv2.imencode(".jpg", frame, REPLAY_QUALITY)
             jpg_bytes = jpg_buf.tobytes()
 
@@ -868,18 +913,28 @@ def _draw_dashed_polygon(img, poly_px, color, thickness=2, dash_len=10):
             cv2.line(img, p0, p1, color, thickness)
 
 
+def _line_side(px, py, p1, p2):
+    """Return sign of which side of line p1-p2 the point (px,py) is on.
+    +1, -1, or 0."""
+    cross = (p2[0] - p1[0]) * (py - p1[1]) - (p2[1] - p1[1]) * (px - p1[0])
+    if cross > 0: return 1
+    if cross < 0: return -1
+    return 0
+
+
 def _process_alliance_roi_crop(frame, roi_poly, tracker, scorer_obj, detector_ref, stream_id="default",
                                 alliance_roi_data=None):
-    """Crop bounding box of an alliance ROI polygon, upscale, detect, map back.
+    """Crop ROI bounding box, mask non-ROI pixels black, run YOLO once,
+    push detections through the alliance's tripwire counter.
 
-    roi_poly: [[x,y], ...] normalized polygon (3+ points).
-    Returns: (mapped_balls, stable_pattern, raw_pattern, annotated_crop)
-    annotated_crop is the 640x640 upscaled crop with detection boxes drawn, or None.
+    Tripwire architecture: the user draws gate-trip and overflow-trip
+    polygons inside the ROI. The tracker emits a count event on rising
+    edges of "ball present in tripwire", with a small lockout window
+    so a single physical ball can't be counted twice.
     """
     h, w = frame.shape[:2]
     poly_px = _poly_to_pixels(roi_poly, w, h)
 
-    # Get bounding box of polygon
     bx, by, bw, bh = cv2.boundingRect(poly_px)
     bx2, by2 = bx + bw, by + bh
     bx, by = max(0, bx), max(0, by)
@@ -890,46 +945,38 @@ def _process_alliance_roi_crop(frame, roi_poly, tracker, scorer_obj, detector_re
     if crop.size == 0:
         return [], "", "", None
 
-    # Enhancement pipeline (all optional):
-    #   1. FSRCNN 2× super-resolution on the raw crop (if small enough)
-    #   2. Cubic interpolation to 640x640 (vs linear by default)
-    #   3. Unsharp mask for edge contrast
-    #   4. CLAHE on luminance for local contrast
-    # Skipped entirely when `_enhance_roi_enabled` is False.
+    # Native sampling: feed the ROI bounding box at its actual pixel
+    # dimensions to YOLO (no forced square resize, no aspect distortion).
     if _enhance_roi_enabled:
-        crop_for_resize = _maybe_sr_upscale(crop)
-        upscaled = cv2.resize(crop_for_resize, (640, 640),
-                              interpolation=cv2.INTER_CUBIC)
-        upscaled = _enhance_image(upscaled)
+        processed = _enhance_image(_maybe_sr_upscale(crop))
     else:
-        upscaled = cv2.resize(crop, (640, 640), interpolation=cv2.INTER_LINEAR)
-    annotated = upscaled.copy()
-    # Stash the crop→640 mapping so we can draw alliance zones on the
-    # enhanced ROI feed after detection runs.
-    _crop_ann_meta = {
-        "bx": bx, "by": by, "crop_w": crop_w, "crop_h": crop_h,
-    }
+        processed = crop
+    proc_h, proc_w = processed.shape[:2]
 
+    # ROI polygon mask: blacken pixels outside the user's polygon so YOLO
+    # only sees ramp pixels.
+    sx = proc_w / float(crop_w)
+    sy = proc_h / float(crop_h)
+    roi_in_crop = np.array([
+        [int((p[0] * w - bx) * sx), int((p[1] * h - by) * sy)]
+        for p in roi_poly
+    ], dtype=np.int32)
+    roi_mask = np.zeros((proc_h, proc_w), dtype=np.uint8)
+    cv2.fillPoly(roi_mask, [roi_in_crop], 255)
+    masked_frame = cv2.bitwise_and(processed, processed, mask=roi_mask)
+
+    # ---- Single YOLO inference on the masked ROI ----
     try:
-        balls, stable_pattern, raw_pattern, masks = detector_ref.detect(upscaled, stream_id=stream_id)
+        balls, stable_pattern, raw_pattern, _ = detector_ref.detect(
+            masked_frame, stream_id=stream_id)
     except TypeError:
-        balls, stable_pattern, raw_pattern, masks = detector_ref.detect(upscaled)
+        balls, stable_pattern, raw_pattern, _ = detector_ref.detect(masked_frame)
 
-    # Draw detection boxes on the annotated crop (in crop-space, before remapping)
-    for b in balls:
-        cx = int(b.get("x", 0))
-        cy = int(b.get("y", 0))
-        cwb = int(b.get("w", 0))
-        chb = int(b.get("h", 0))
-        color = (0, 255, 0) if b.get("color") == "G" else (200, 0, 200)
-        cv2.rectangle(annotated, (cx, cy), (cx + cwb, cy + chb), color, 2)
-        conf = b.get("confidence", 0)
-        cv2.putText(annotated, f"{b.get('color','?')} {conf:.2f}",
-                    (cx, cy - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
-
-    # Map detection coordinates back to full-frame space
-    scale_x = crop_w / 640.0
-    scale_y = crop_h / 640.0
+    # Map detection coordinates from processed-crop space back to the full
+    # original frame so tripwires (in normalized full-frame coords) hit-test
+    # correctly. Filter to balls actually inside the user-drawn ROI poly.
+    scale_x = crop_w / float(proc_w)
+    scale_y = crop_h / float(proc_h)
     mapped = []
     for b in balls:
         b["center_x"] = bx + b.get("center_x", 0) * scale_x
@@ -942,40 +989,54 @@ def _process_alliance_roi_crop(frame, roi_poly, tracker, scorer_obj, detector_re
         if _point_in_poly(b["center_x"], b["center_y"], poly_px):
             mapped.append(b)
 
-    # Feed tracker for total count / classified-vs-overflow state
+    # ---- Tripwire counter update ----
     if tracker is not None:
         tracker.update(mapped, (h, w))
 
-    # Build the colors list for MOTIF scoring by snapshotting the CURRENT
-    # balls on the RAMP, sorted along the ramp direction (from gate outward).
-    # This means each position on the ramp is compared to motif[i] regardless
-    # of order-of-entry. If a ball is undetected in a given frame the slot
-    # will briefly be absent — but next frame it'll reappear.
-    ramp_colors = _sort_balls_along_ramp(mapped, roi_poly, tracker, w, h)
-    if tracker is not None:
+        prev = scorer_obj.get_scores()
         totals = tracker.get_totals()
+        # Pattern colors are NOT updated live anymore — pattern_locked
+        # gates that. We pass an empty list so live updates are a no-op
+        # for ramp_colors, while classified/overflow counts still tick.
         scorer_obj.update(
-            ramp_colors,
+            [],
             classified_total=totals["classified"],
             overflow_total=totals["overflow"],
         )
-    else:
-        scorer_obj.update(ramp_colors)
+        _log_score_deltas(stream_id, prev, scorer_obj.get_scores())
 
-    # Overlay alliance zones (ROI/gate/exit/divider) on the enhanced ROI
-    # feed, plus a tiny color-key bar at the bottom.
-    if alliance_roi_data:
-        meta = {
-            "bx": _crop_ann_meta["bx"],
-            "by": _crop_ann_meta["by"],
-            "crop_w": _crop_ann_meta["crop_w"],
-            "crop_h": _crop_ann_meta["crop_h"],
-            "full_w": w,
-            "full_h": h,
-        }
-        _draw_roi_feed_zones(annotated, alliance_roi_data, meta)
+    # ---- Build the windowed visualization (single panel, not vstacked) ----
+    view_w, view_h = 640, 360
+    view = cv2.resize(masked_frame, (view_w, view_h), interpolation=cv2.INTER_AREA)
+    sx_disp = view_w / float(proc_w)
+    sy_disp = view_h / float(proc_h)
 
-    return mapped, stable_pattern, raw_pattern, annotated
+    # Draw tripwire polygons in crop-space so the user sees where they sit
+    a_data = alliance_roi_data or {}
+    for trip_key, trip_color in (("gate_trip",      (255, 200,   0)),
+                                 ("overflow_trip", (  0, 200, 255))):
+        poly = a_data.get(trip_key)
+        if poly and len(poly) >= 3:
+            pts = []
+            for px_n, py_n in poly:
+                ox = px_n * w - bx
+                oy = py_n * h - by
+                pts.append([int(ox * sx * sx_disp), int(oy * sy * sy_disp)])
+            cv2.polylines(view, [np.array(pts, dtype=np.int32)],
+                          True, trip_color, 2, cv2.LINE_AA)
+
+    # Draw detection boxes
+    for b in mapped:
+        cx = int((b["x"] - bx) * sx * sx_disp)
+        cy = int((b["y"] - by) * sy * sy_disp)
+        cwb = int(b["w"] * sx * sx_disp)
+        chb = int(b["h"] * sy * sy_disp)
+        color = (0, 255, 0) if b.get("color") == "G" else (200, 0, 200)
+        cv2.rectangle(view, (cx, cy), (cx + cwb, cy + chb), color, 2)
+        cv2.putText(view, f"{b.get('color','?')} {b.get('confidence',0):.2f}",
+                    (cx, max(cy - 4, 10)), cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1)
+
+    return mapped, stable_pattern, raw_pattern, view
 
 
 _ZONE_COLORS = {
@@ -1159,6 +1220,9 @@ def _draw_alliance_overlays(processed, roi_data, alliance, color_roi, color_gate
         cv2.line(processed, p1, p2, (0, 215, 255), 1, cv2.LINE_AA)
 
 
+_debug_mode = False   # Set by --debug flag; skips YOLO entirely
+
+
 def process_loop():
     """Processing thread: picks up the latest grabbed frame, runs detection for both alliances."""
     global latest_processed_jpg, latest_red_roi_jpg, latest_blue_roi_jpg
@@ -1194,6 +1258,70 @@ def process_loop():
         last_seq = seq
         roi_data = load_roi_config()
         h, w = frame.shape[:2]
+
+        # ---- DEBUG MODE: zone overlays only, no YOLO ----
+        if _debug_mode:
+            processed = frame.copy()
+            # Draw res/fps info
+            with camera_stats_lock:
+                info = f"{camera_stats['resolution_label']} {camera_stats['width']}x{camera_stats['height']} | {camera_stats['grab_fps']:.1f} fps | Q{config.ESP32_DEFAULT_QUALITY}"
+            cv2.putText(processed, info, (10, 25),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 255), 1)
+            cv2.putText(processed, "DEBUG MODE — no detection", (10, 48),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 200, 200), 1)
+
+            # Draw all alliance overlays
+            _draw_alliance_overlays(processed, roi_data, "red", RED_COLOR, RED_GATE_COLOR)
+            _draw_alliance_overlays(processed, roi_data, "blue", BLUE_COLOR, BLUE_GATE_COLOR)
+
+            # Encode and publish
+            _, proc_buf = cv2.imencode(".jpg", processed, JPEG_ENCODE_PARAMS)
+            proc_jpg = proc_buf.tobytes()
+
+            # Generate ROI crop previews (just crops, no YOLO)
+            red_roi_jpg = None
+            blue_roi_jpg = None
+            for alliance in ("red", "blue"):
+                a_roi = (roi_data.get(alliance) or {}).get("roi")
+                if a_roi and len(a_roi) >= 3:
+                    poly_px = _poly_to_pixels(a_roi, w, h)
+                    bx, by, bw, bh = cv2.boundingRect(poly_px)
+                    bx2, by2 = min(w, bx + bw), min(h, by + bh)
+                    bx, by = max(0, bx), max(0, by)
+                    crop = frame[by:by2, bx:bx2]
+                    if crop.size > 0:
+                        resized = cv2.resize(crop, (640, 640), interpolation=cv2.INTER_LINEAR)
+                        a_data = roi_data.get(alliance) or {}
+                        meta = {"bx": bx, "by": by,
+                                "crop_w": max(bx2 - bx, 1),
+                                "crop_h": max(by2 - by, 1),
+                                "full_w": w, "full_h": h}
+                        _draw_roi_feed_zones(resized, a_data, meta)
+                        _, rbuf = cv2.imencode(".jpg", resized, JPEG_ENCODE_PARAMS)
+                        if alliance == "red":
+                            red_roi_jpg = rbuf.tobytes()
+                        else:
+                            blue_roi_jpg = rbuf.tobytes()
+
+            with output_lock:
+                latest_processed_jpg = proc_jpg
+                latest_red_roi_jpg = red_roi_jpg
+                latest_blue_roi_jpg = blue_roi_jpg
+                latest_balls = []
+                latest_stable_pattern = ""
+                latest_raw_pattern = ""
+
+            proc_count += 1
+            elapsed = time.time() - last_time
+            if elapsed >= 1.0:
+                pfps = proc_count / elapsed
+                fps_counter["process"] = pfps
+                with camera_stats_lock:
+                    camera_stats["process_fps"] = pfps
+                proc_count = 0
+                last_time = time.time()
+            continue
+        # ---- END DEBUG MODE ----
 
         all_balls = []
         combined_stable = ""
@@ -1467,6 +1595,8 @@ def api_match_start():
         ramp_tracker_blue.reset()
     if hasattr(detector, 'reset_tracker'):
         detector.reset_tracker()
+    scorer_red.unlock_pattern()
+    scorer_blue.unlock_pattern()
     scorer_red.update([])
     scorer_blue.update([])
     with match_state_lock:
@@ -1490,6 +1620,8 @@ def api_match_reset():
         ramp_tracker_blue.reset()
     if hasattr(detector, 'reset_tracker'):
         detector.reset_tracker()
+    scorer_red.unlock_pattern()
+    scorer_blue.unlock_pattern()
     scorer_red.update([])
     scorer_blue.update([])
     with match_state_lock:
@@ -1515,11 +1647,11 @@ def api_match_advance():
         current = match_state["phase"]
 
     if current == "AUTO":
+        # Snapshot what's on the ramp BEFORE reading the score so the
+        # locked pattern is reflected in the AUTO snapshot row.
+        _snapshot_and_lock_pattern("AUTO")
         red_snap = scorer_red.get_scores()
         blue_snap = scorer_blue.get_scores()
-        # Freeze balls currently on the ramp so they carry over into TELEOP
-        # without being recounted (handles track_id reassignment during the
-        # AUTO-TELEOP pause).
         if ramp_tracker_red is not None:
             ramp_tracker_red.handoff_phase()
         if ramp_tracker_blue is not None:
@@ -1529,8 +1661,13 @@ def api_match_advance():
             match_state["auto_snapshot"]["blue"] = blue_snap
             match_state["phase"] = "TELEOP"
             match_state["started_at"] = time.time()
+        # Pattern stays LOCKED through TELEOP so the AUTO consensus
+        # colors remain visible in the UI. They'll be overwritten when
+        # TELEOP ends and we sample again.
+        _emit_phase_pattern_event("AUTO")
         print("[MATCH] AUTO ended (manual), TELEOP started")
     elif current == "TELEOP":
+        _snapshot_and_lock_pattern("TELEOP")
         red_snap = scorer_red.get_scores()
         blue_snap = scorer_blue.get_scores()
         with match_state_lock:
@@ -1539,6 +1676,7 @@ def api_match_advance():
             match_state["phase"] = "ENDED"
             match_state["started_at"] = None
         _replay_paused = True
+        _emit_phase_pattern_event("TELEOP")
         print("[MATCH] TELEOP ended (manual), match ENDED")
     else:
         return jsonify({"status": "error",
@@ -1594,19 +1732,49 @@ def api_cam_status():
         return jsonify({"status": "error", "message": str(e)}), 502
 
 
+def _discover_yolo_models():
+    """Walk training/runs/detect/*/weights/best.pt and return their paths.
+    Used by the UI to populate a "Model" dropdown for hot-swapping."""
+    base = os.path.join(os.path.dirname(__file__), "training", "runs", "detect")
+    out = []
+    if os.path.isdir(base):
+        for name in sorted(os.listdir(base)):
+            best = os.path.join(base, name, "weights", "best.pt")
+            if os.path.isfile(best):
+                # Store relative-to-project path so it round-trips cleanly.
+                rel = os.path.relpath(best, os.path.dirname(__file__))
+                out.append({"name": name, "path": rel})
+    # Always include whatever the config currently points at, even if it
+    # doesn't live under runs/detect (e.g. a manual pretrained file).
+    cur = config.YOLO_MODEL_PATH
+    if cur and not any(o["path"] == cur for o in out):
+        out.insert(0, {"name": f"(custom) {os.path.basename(cur)}", "path": cur})
+    return out
+
+
 @app.route("/api/yolo_config", methods=["GET"])
 def api_yolo_config():
-    """Return current YOLO config for UI display."""
+    """Return current YOLO + replay tuning config for UI display."""
     return jsonify({
         "confidence": config.YOLO_CONFIDENCE,
         "iou_threshold": config.YOLO_IOU_THRESHOLD,
         "model_path": config.YOLO_MODEL_PATH,
+        "available_models": _discover_yolo_models(),
+        "tta": bool(getattr(config, "YOLO_TTA", False)),
+        "conf_far": float(getattr(config, "YOLO_CONF_FAR", 0.05)),
+        "conf_near": float(getattr(config, "YOLO_CONF_NEAR", 0.12)),
+        "max_imgsz": int(getattr(config, "YOLO_MAX_IMGSZ", 1280)),
+        "replay_sim_compression": bool(
+            getattr(config, "REPLAY_SIMULATE_LIVE_COMPRESSION", False)),
+        "replay_sim_quality": int(getattr(config, "REPLAY_SIM_JPEG_QUALITY", 60)),
+        "tripwire_match_radius_px": int(
+            getattr(config, "TRIPWIRE_MATCH_RADIUS_PX", 40)),
     })
 
 
 @app.route("/api/yolo_config", methods=["POST"])
 def api_set_yolo_config():
-    """Update YOLO config live."""
+    """Update YOLO + replay tuning config live."""
     data = request.get_json(silent=True) or {}
 
     if "confidence" in data:
@@ -1617,6 +1785,44 @@ def api_set_yolo_config():
         config.YOLO_IOU_THRESHOLD = float(data["iou_threshold"])
         if hasattr(detector, 'iou_threshold'):
             detector.iou_threshold = config.YOLO_IOU_THRESHOLD
+    if "tta" in data:
+        config.YOLO_TTA = bool(data["tta"])
+    if "conf_far" in data:
+        config.YOLO_CONF_FAR = float(data["conf_far"])
+    if "conf_near" in data:
+        config.YOLO_CONF_NEAR = float(data["conf_near"])
+    if "max_imgsz" in data:
+        v = int(data["max_imgsz"])
+        if v in (640, 960, 1280, 1600):
+            config.YOLO_MAX_IMGSZ = v
+    if "replay_sim_compression" in data:
+        config.REPLAY_SIMULATE_LIVE_COMPRESSION = bool(data["replay_sim_compression"])
+    if "replay_sim_quality" in data:
+        config.REPLAY_SIM_JPEG_QUALITY = int(data["replay_sim_quality"])
+    if "tripwire_match_radius_px" in data:
+        v = max(5, min(300, int(data["tripwire_match_radius_px"])))
+        config.TRIPWIRE_MATCH_RADIUS_PX = v
+        # Push into the live trackers so the change takes effect immediately.
+        for t in (ramp_tracker_red, ramp_tracker_blue):
+            if t is not None and hasattr(t, "set_match_radius"):
+                t.set_match_radius(v)
+    if "model_path" in data:
+        new_path = data["model_path"]
+        # Resolve relative paths against the project root so the dropdown
+        # values (which are relative) load correctly.
+        resolved = new_path
+        if not os.path.isabs(new_path):
+            resolved = os.path.join(os.path.dirname(__file__), new_path)
+        if not os.path.isfile(resolved):
+            return jsonify({"status": "error",
+                            "message": f"Model file not found: {resolved}"}), 400
+        try:
+            detector.swap_model(resolved)
+            config.YOLO_MODEL_PATH = new_path  # store the form the UI sent
+            print(f"[MODEL] Hot-swapped to {new_path}")
+        except Exception as e:
+            return jsonify({"status": "error",
+                            "message": f"swap_model failed: {e}"}), 500
 
     return jsonify({"status": "ok"})
 
@@ -1667,24 +1873,23 @@ def api_set_roi():
         if a_data is None:
             continue
         if alliance not in save_data:
-            save_data[alliance] = {"roi": None, "gate": None, "exit": None, "divider": None}
+            save_data[alliance] = {"roi": None, "gate_trip": None, "overflow_trip": None}
         if "roi" in a_data:
             save_data[alliance]["roi"] = a_data["roi"]
             if tracker is not None and a_data["roi"] is not None:
                 tracker.set_roi(a_data["roi"])
-        if "gate" in a_data:
-            save_data[alliance]["gate"] = a_data["gate"]
-            if tracker is not None and a_data["gate"] is not None:
-                tracker.set_gate_zone(a_data["gate"])
-        if "exit" in a_data:
-            save_data[alliance]["exit"] = a_data["exit"]
-            if tracker is not None:
-                tracker.set_exit_zone(a_data["exit"])
-        if "divider" in a_data:
-            save_data[alliance]["divider"] = a_data["divider"]
-            # Propagate to tracker if it supports a divider (optional method).
-            if tracker is not None and hasattr(tracker, "set_divider"):
-                tracker.set_divider(a_data["divider"])
+        if "gate_trip" in a_data:
+            save_data[alliance]["gate_trip"] = a_data["gate_trip"]
+            if tracker is not None and a_data["gate_trip"] is not None:
+                tracker.set_gate_trip(a_data["gate_trip"])
+        if "overflow_trip" in a_data:
+            save_data[alliance]["overflow_trip"] = a_data["overflow_trip"]
+            if tracker is not None and a_data["overflow_trip"] is not None:
+                tracker.set_overflow_trip(a_data["overflow_trip"])
+        # Drop legacy fields if the client sends them (no-op storage).
+        for legacy in ("gate", "exit", "divider"):
+            if legacy in a_data:
+                save_data[alliance].pop(legacy, None)
 
     save_roi_config(save_data)
     return jsonify({"status": "ok"})
@@ -1699,6 +1904,270 @@ _TRACKER_TUNABLE_FIELDS = (
     "smoothing_window",
     "classified_max",
 )
+
+
+_setup_framesize = None  # stash the low-res framesize when boosting
+
+
+@app.route("/api/camera/boost", methods=["POST"])
+def api_camera_boost():
+    """Switch the ESP32 to high resolution for match play.
+
+    POST {"framesize": 16}   — push FHD (or whatever value) to the camera.
+    POST {"reset": true}     — drop back to the setup-mode framesize.
+    """
+    global _setup_framesize
+    data = request.get_json(silent=True) or {}
+
+    if data.get("reset"):
+        if _setup_framesize is not None:
+            config.ESP32_DEFAULT_FRAMESIZE = _setup_framesize
+            _setup_framesize = None
+        configure_esp32_camera(force=True)
+        return jsonify({"status": "ok", "mode": "setup",
+                        "framesize": config.ESP32_DEFAULT_FRAMESIZE})
+
+    fs = data.get("framesize")
+    if fs is None:
+        return jsonify({"status": "error",
+                        "message": "Provide 'framesize' (int) or 'reset': true"}), 400
+    fs = int(fs)
+    if _setup_framesize is None:
+        _setup_framesize = config.ESP32_DEFAULT_FRAMESIZE
+    config.ESP32_DEFAULT_FRAMESIZE = fs
+    configure_esp32_camera(force=True)
+    return jsonify({"status": "ok", "mode": "boosted",
+                    "framesize": fs,
+                    "setup_framesize": _setup_framesize})
+
+
+
+_score_events = []
+_SCORE_EVENT_MAX = 200
+_score_event_seq = 0
+_score_event_lock = threading.Lock()
+
+
+def _log_score_deltas(stream_id, prev, cur, include_pattern=False):
+    """Compare two scorer snapshots and log any score change as an event.
+
+    During the match we ONLY emit classified and overflow events. Pattern
+    points are evaluated and emitted explicitly when the user ends AUTO
+    or TELEOP (see api_advance_phase). This keeps the live log focused on
+    what's happening per ball, with pattern bonus appearing as one
+    summary event per period.
+    """
+    global _score_event_seq
+    alliance = "red" if "red" in stream_id else ("blue" if "blue" in stream_id else stream_id)
+    fields = [
+        ("classified_count", "classified", config.POINTS_CLASSIFIED_TELEOP),
+        ("overflow_count",   "overflow",   config.POINTS_OVERFLOW_TELEOP),
+    ]
+    if include_pattern:
+        fields.append(("pattern_match_count", "pattern", config.POINTS_PATTERN_MATCH))
+    diffs = []
+    for key, label, pts in fields:
+        d = cur.get(key, 0) - prev.get(key, 0)
+        if d > 0:
+            diffs.append({"label": label, "count": d, "points": d * pts})
+    if not diffs:
+        return
+    with _score_event_lock:
+        for diff in diffs:
+            _score_event_seq += 1
+            _score_events.append({
+                "id": _score_event_seq,
+                "t": time.time(),
+                "alliance": alliance,
+                **diff,
+            })
+        if len(_score_events) > _SCORE_EVENT_MAX:
+            del _score_events[: len(_score_events) - _SCORE_EVENT_MAX]
+
+
+PATTERN_SAMPLE_FRAMES = 45  # ~3s at 15fps
+
+
+def _snapshot_and_lock_pattern(phase_name):
+    """At end of AUTO/TELEOP, take ~3 seconds of recent ROI snapshots,
+    sort each frame's balls from opposite-gate-end → gate-end (the
+    gate_trip polygon centroid is the gate anchor), and lock the
+    consensus (mode color per slot index) as the MOTIF pattern.
+
+    Sampling across a window beats single-frame snapshots because:
+      - YOLO has occasional per-frame drops; a 45-frame mode survives them
+      - balls may briefly shift during the period-end pause
+    """
+    from collections import Counter
+    for alliance, scorer, tracker in (
+            ("red", scorer_red, ramp_tracker_red),
+            ("blue", scorer_blue, ramp_tracker_blue)):
+        if scorer is None or tracker is None:
+            continue
+        history = tracker.get_recent_balls_history(PATTERN_SAMPLE_FRAMES) \
+            if hasattr(tracker, "get_recent_balls_history") else []
+        if not history:
+            scorer.lock_pattern([])
+            print(f"[PATTERN] {alliance} ({phase_name}): no history → locked empty")
+            continue
+        roi = tracker.roi
+        gate_anchor = getattr(tracker, "gate_trip_poly", None)
+
+        # Per-slot color counters across the sampling window.
+        slot_counts = [Counter() for _ in range(9)]
+        for _frame_idx, balls in history:
+            ordered = _sort_balls_for_pattern(balls, roi, gate_anchor)
+            for i, color in enumerate(ordered[:9]):
+                slot_counts[i][color] += 1
+
+        # Mode per slot. A slot with no observations is dropped (treat
+        # as "no ball there" — the pattern just becomes shorter).
+        consensus = []
+        for i in range(9):
+            if not slot_counts[i]:
+                break  # no balls observed at this slot index → end of ramp
+            top_color, _votes = slot_counts[i].most_common(1)[0]
+            consensus.append(top_color)
+        scorer.lock_pattern(consensus)
+        print(f"[PATTERN] {alliance} ({phase_name}): "
+              f"{len(history)} frames sampled → locked {consensus}")
+
+
+def _sort_balls_for_pattern(balls, roi_poly, gate_anchor):
+    """Sort detected balls along the OPPOSITE-of-gate → gate axis.
+    Index 0 = far end (opposite gate), index N-1 = at the gate.
+
+    Balls are expected to carry normalized coords ('x_norm', 'y_norm')
+    as written into the tripwire history. The polygon coords are also
+    normalized, so all the math stays in one coordinate system.
+
+    Sort key: distance from the gate-trip centroid, DESCENDING.
+    """
+    candidates = [b for b in balls if b.get("color") in ("G", "P")]
+    if not candidates:
+        return []
+    if gate_anchor and len(gate_anchor) >= 3:
+        gx = sum(p[0] for p in gate_anchor) / len(gate_anchor)
+        gy = sum(p[1] for p in gate_anchor) / len(gate_anchor)
+        def dist2(b):
+            dx = b.get("x_norm", 0) - gx
+            dy = b.get("y_norm", 0) - gy
+            return dx * dx + dy * dy
+        # Negate so ascending sort puts FAR (large distance) first.
+        ordered = sorted(candidates, key=lambda b: -dist2(b))
+    else:
+        # Fallback: left-to-right by x_norm.
+        ordered = sorted(candidates, key=lambda b: b.get("x_norm", 0))
+    return [b["color"] for b in ordered]
+
+
+def _emit_phase_pattern_event(phase_name):
+    """Emit one pattern score event per alliance for the just-ended phase."""
+    global _score_event_seq
+    for alliance, scorer in (("red", scorer_red), ("blue", scorer_blue)):
+        if scorer is None:
+            continue
+        snap = scorer.get_scores()
+        match_count = snap.get("pattern_match_count", 0)
+        if match_count == 0:
+            continue
+        with _score_event_lock:
+            _score_event_seq += 1
+            _score_events.append({
+                "id": _score_event_seq,
+                "t": time.time(),
+                "alliance": alliance,
+                "label": f"pattern ({phase_name})",
+                "count": match_count,
+                "points": match_count * config.POINTS_PATTERN_MATCH,
+            })
+            if len(_score_events) > _SCORE_EVENT_MAX:
+                del _score_events[: len(_score_events) - _SCORE_EVENT_MAX]
+
+
+@app.route("/api/score_events", methods=["GET"])
+def api_score_events():
+    """Return score events newer than the given id (default: all)."""
+    since = int(request.args.get("since", 0))
+    with _score_event_lock:
+        out = [e for e in _score_events if e["id"] > since]
+    return jsonify({"events": out})
+
+
+@app.route("/api/tripwire_debug", methods=["GET"])
+def api_tripwire_debug():
+    """Live debug view of the tripwire counters: active tracks +
+    chronological event log for each tripwire (gate + overflow), per
+    alliance. Used by the dashboard's TRIPWIRE TUNING panel.
+
+    Query params (optional):
+      since_red_gate, since_red_overflow, since_blue_gate, since_blue_overflow
+      — last seq id seen by the client, so only newer events are returned.
+    """
+    def _state_for(tr, prefix):
+        if tr is None:
+            return None
+        since = {
+            "gate":     int(request.args.get(f"since_{prefix}_gate", 0)),
+            "overflow": int(request.args.get(f"since_{prefix}_overflow", 0)),
+        }
+        return tr.get_debug_state(since)
+    return jsonify({
+        "red":  _state_for(ramp_tracker_red, "red"),
+        "blue": _state_for(ramp_tracker_blue, "blue"),
+    })
+
+
+@app.route("/api/exit_events", methods=["GET"])
+def api_exit_events():
+    """Return recent exit events from both trackers, with alliance tag."""
+    since = int(request.args.get("since", 0))
+    out = []
+    for alliance, tr in [("red", ramp_tracker_red), ("blue", ramp_tracker_blue)]:
+        if tr is None or not hasattr(tr, "get_exit_events"):
+            continue
+        for ev in tr.get_exit_events(since_frame=since):
+            out.append({
+                "alliance": alliance,
+                "color": ev["color"],
+                "t": ev["t"],
+                "frame": ev["frame"],
+            })
+    out.sort(key=lambda e: e["t"])
+    return jsonify({"events": out})
+
+
+@app.route("/api/camera/configure", methods=["POST"])
+def api_camera_configure():
+    """Change ESP32 camera settings on the fly.
+
+    POST {"framesize": N}        — change resolution
+    POST {"quality": N}          — change JPEG quality
+    POST {"framesize": N, "quality": N}  — both at once
+    POST {"vflip": 0|1}          — vertical flip
+    POST {"hmirror": 0|1}        — horizontal mirror
+
+    Framesize values (Freenove ESP32-S3):
+      8=VGA(640x480), 9=SVGA(800x600), 10=XGA(1024x768),
+      11=HD(1280x720), 12=SXGA(1280x1024), 13=UXGA(1600x1200)
+    """
+    data = request.get_json(silent=True) or {}
+    results = {}
+    for var in ("framesize", "quality", "vflip", "hmirror"):
+        if var not in data:
+            continue
+        val = int(data[var])
+        try:
+            url = f"{config.ESP32_CONTROL_URL}?var={var}&val={val}"
+            resp = http_requests.get(url, timeout=3)
+            results[var] = {"val": val, "ok": resp.status_code == 200}
+            if var == "framesize":
+                config.ESP32_DEFAULT_FRAMESIZE = val
+            elif var == "quality":
+                config.ESP32_DEFAULT_QUALITY = val
+        except Exception as e:
+            results[var] = {"val": val, "ok": False, "error": str(e)}
+    return jsonify({"status": "ok", "results": results})
 
 
 @app.route("/api/camera/reapply", methods=["POST"])
@@ -1800,6 +2269,8 @@ def api_reset_ramp():
         ramp_tracker_blue.reset()
     if hasattr(detector, 'reset_tracker'):
         detector.reset_tracker()
+    scorer_red.unlock_pattern()
+    scorer_blue.unlock_pattern()
     scorer_red.update([])
     scorer_blue.update([])
     return jsonify({"status": "ok"})
@@ -1843,6 +2314,8 @@ def api_play_match():
         ramp_tracker_blue.reset()
     if hasattr(detector, 'reset_tracker'):
         detector.reset_tracker()
+    scorer_red.unlock_pattern()
+    scorer_blue.unlock_pattern()
     scorer_red.update([])
     scorer_blue.update([])
 
@@ -1864,7 +2337,7 @@ def api_replay_pause():
 
 @app.route("/api/replay/status", methods=["GET"])
 def api_replay_status():
-    """Get replay state including seek position."""
+    """Get replay state including seek position + playback speed."""
     total = _replay_total_frames
     cur = _replay_current_frame
     fps = _replay_src_fps or 30
@@ -1876,7 +2349,22 @@ def api_replay_status():
         "current_sec": round(cur / fps, 1) if fps else 0,
         "total_sec": round(total / fps, 1) if fps else 0,
         "src_fps": round(fps, 1),
+        "playback_fps": round(_replay_target_fps, 1),
     })
+
+
+@app.route("/api/replay/speed", methods=["POST"])
+def api_replay_speed():
+    """Adjust replay playback FPS. Body either {"fps": <int>} for an
+    absolute target or {"mult": <float>} to multiply current FPS."""
+    global _replay_target_fps
+    data = request.get_json(silent=True) or {}
+    if "fps" in data:
+        _replay_target_fps = max(1.0, min(120.0, float(data["fps"])))
+    elif "mult" in data:
+        _replay_target_fps = max(1.0, min(120.0,
+                                          _replay_target_fps * float(data["mult"])))
+    return jsonify({"status": "ok", "playback_fps": round(_replay_target_fps, 1)})
 
 
 @app.route("/api/replay/seek", methods=["POST"])
@@ -1908,6 +2396,10 @@ if __name__ == "__main__":
                         help="Use /capture polling instead of MJPEG stream (more compatible)")
     parser.add_argument("--stream-url", default=None, metavar="URL",
                         help="Override ESP32 stream URL (e.g. http://192.168.4.1/stream)")
+    parser.add_argument("--framesize", type=int, default=None,
+                        help="Override ESP32 framesize enum value (e.g. 14=SXGA 1280x1024, "
+                             "15=UXGA 1600x1200, 16=FHD 1920x1080). Check [CAM] log "
+                             "to confirm the camera accepted it.")
     parser.add_argument("--yolo-model", default=None, metavar="PATH",
                         help="Path to YOLO .pt model file")
     parser.add_argument("--detector", default="yolo", choices=["yolo"],
@@ -1925,6 +2417,11 @@ if __name__ == "__main__":
     parser.add_argument("--live", action="store_true",
                         help="Force live ESP32-S3 camera (clears --replay/--usb). "
                              "Same as default ESP32 path, but explicit.")
+    parser.add_argument("--debug", action="store_true",
+                        help="Debug/setup mode. Streams raw camera feed with zone "
+                             "overlays, NO YOLO detection. Use to draw zones, tune "
+                             "resolution/quality, and verify camera setup before "
+                             "running a real match.")
     parser.add_argument("--enhance-roi", action="store_true",
                         help="Apply cheap post-upscale enhancement (cubic + "
                              "unsharp mask + CLAHE) to each alliance ROI crop. "
@@ -1949,8 +2446,15 @@ if __name__ == "__main__":
         else:
             print("[ENHANCE] DNN super-resolution unavailable, continuing without it")
 
+    if args.debug:
+        args.replay = None
+        args.usb = None
+        args.live = True
+        import sys as _sys
+        _sys.modules[__name__]._debug_mode = True
+        print("[DEBUG] Setup/debug mode — NO YOLO detection, zone overlays only")
+
     if args.live:
-        # Make intent unambiguous: ignore replay/usb if accidentally passed alongside.
         args.replay = None
         args.usb = None
         print("[LIVE] ESP32-S3 camera mode requested — connect to the AP at "
@@ -1958,54 +2462,61 @@ if __name__ == "__main__":
 
     use_usb = args.usb is not None
 
-    # Override stream URL if provided
+    # Override stream URL / framesize if provided
     if args.stream_url:
         config.ESP32_STREAM_URL = args.stream_url
+    if args.framesize is not None:
+        config.ESP32_DEFAULT_FRAMESIZE = args.framesize
+        print(f"[CONFIG] Framesize override: {args.framesize}")
 
-    # Initialize detector (hybrid HSV+YOLO cascade, or pure YOLO)
-    try:
-        model_path = args.yolo_model or config.YOLO_MODEL_PATH
-        from yolo_detector import YOLODetector
-        detector = YOLODetector(model_path=model_path)
-        det_mode = f"YOLO ({model_path})"
-    except ImportError as e:
-        print(f"[!] Detector init failed (missing dependency): {e}")
-        print("    Install ultralytics: pip install ultralytics")
-        import sys
-        sys.exit(1)
-    except Exception as e:
-        print(f"[!] Detector init failed: {e}")
-        print("    Check that the model file exists and ultralytics is installed")
-        import sys
-        sys.exit(1)
+    # Initialize detector (skip entirely in debug mode — no YOLO needed)
+    if args.debug:
+        det_mode = "NONE (debug mode)"
+    else:
+        try:
+            model_path = args.yolo_model or config.YOLO_MODEL_PATH
+            from yolo_detector import YOLODetector
+            detector = YOLODetector(model_path=model_path)
+            det_mode = f"YOLO ({model_path})"
+        except ImportError as e:
+            print(f"[!] Detector init failed (missing dependency): {e}")
+            print("    Install ultralytics: pip install ultralytics")
+            import sys
+            sys.exit(1)
+        except Exception as e:
+            print(f"[!] Detector init failed: {e}")
+            print("    Check that the model file exists and ultralytics is installed")
+            import sys
+            sys.exit(1)
 
-    # Initialize dual ramp trackers
+    # Initialize dual tripwire counters (one per alliance).
+    # The old simple/full tracker modes are replaced with the
+    # event-based tripwire counter — see tripwire_counter.py.
     try:
-        if args.tracker == "simple":
-            from simple_count_tracker import SimpleCountTracker as _Tracker
-            tracker_mode = "SIMPLE (smoothed live count)"
-        else:
-            from ramp_tracker import RampTracker as _Tracker
-            tracker_mode = "FULL (cumulative classified/overflow)"
-        ramp_tracker_red = _Tracker()
-        ramp_tracker_blue = _Tracker()
+        from tripwire_counter import TripwireCounter as _Tracker
+        tracker_mode = "TRIPWIRE (event-based gate + overflow counting)"
+        ramp_tracker_red = _Tracker(
+            match_radius_px=int(getattr(config, "TRIPWIRE_MATCH_RADIUS_PX", 40)),
+            max_misses=int(getattr(config, "TRIPWIRE_MAX_MISSES", 3)),
+        )
+        ramp_tracker_blue = _Tracker(
+            match_radius_px=int(getattr(config, "TRIPWIRE_MATCH_RADIUS_PX", 40)),
+            max_misses=int(getattr(config, "TRIPWIRE_MAX_MISSES", 3)),
+        )
         print(f"  Tracker: {tracker_mode}")
-        # Load saved ROI/gate config for each alliance
+        # Load saved ROI/tripwire config for each alliance
         roi_data = load_roi_config()
         for alliance, tracker in [("red", ramp_tracker_red), ("blue", ramp_tracker_blue)]:
             a_data = roi_data.get(alliance, {})
             if a_data.get("roi"):
                 tracker.set_roi(a_data["roi"])
-                print(f"  Loaded {alliance} ROI: {a_data['roi']}")
-            if a_data.get("gate"):
-                tracker.set_gate_zone(a_data["gate"])
-                print(f"  Loaded {alliance} Gate: {a_data['gate']}")
-            if a_data.get("exit"):
-                tracker.set_exit_zone(a_data["exit"])
-                print(f"  Loaded {alliance} Exit: {a_data['exit']}")
-            if a_data.get("divider") and hasattr(tracker, "set_divider"):
-                tracker.set_divider(a_data["divider"])
-                print(f"  Loaded {alliance} Divider: {a_data['divider']}")
+                print(f"  Loaded {alliance} ROI ({len(a_data['roi'])} pts)")
+            if a_data.get("gate_trip"):
+                tracker.set_gate_trip(a_data["gate_trip"])
+                print(f"  Loaded {alliance} Gate-Trip ({len(a_data['gate_trip'])} pts)")
+            if a_data.get("overflow_trip"):
+                tracker.set_overflow_trip(a_data["overflow_trip"])
+                print(f"  Loaded {alliance} Overflow-Trip ({len(a_data['overflow_trip'])} pts)")
     except ImportError:
         print("[i] ramp_tracker module not found — using direct detection mode")
         ramp_tracker_red = None

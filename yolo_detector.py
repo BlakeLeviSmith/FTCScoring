@@ -12,6 +12,34 @@ import config
 from detector import StableDetector
 
 
+def _boost_green(frame):
+    """Selectively increase saturation+brightness in the green hue range.
+
+    Boosts S and V only for pixels where hue is in the green range (35-85).
+    Other pixels (purple, ramp, robots, etc.) are left untouched.
+
+    NOTE: cv2.add(src, scalar, mask=...) ZEROS OUT non-masked pixels — that
+    was a bug in an earlier version that killed all detection. We use direct
+    numpy indexing instead so non-green pixels stay exactly as they were.
+    """
+    sat_boost = config.GREEN_SAT_BOOST
+    val_boost = config.GREEN_VAL_BOOST
+    if sat_boost == 0 and val_boost == 0:
+        return frame  # boost disabled, return as-is
+    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+    h, s, v = cv2.split(hsv)
+    green_idx = (h >= 35) & (h <= 85)
+    if sat_boost:
+        s_new = s.astype(np.int16)
+        s_new[green_idx] = np.clip(s_new[green_idx] + sat_boost, 0, 255)
+        s = s_new.astype(np.uint8)
+    if val_boost:
+        v_new = v.astype(np.int16)
+        v_new[green_idx] = np.clip(v_new[green_idx] + val_boost, 0, 255)
+        v = v_new.astype(np.uint8)
+    return cv2.cvtColor(cv2.merge([h, s, v]), cv2.COLOR_HSV2BGR)
+
+
 class YOLODetector:
     """Detects purple and green balls using a trained YOLOv8 nano model."""
 
@@ -61,6 +89,20 @@ class YOLODetector:
         else:
             self._stream_models.pop(stream_id, None)
 
+    def swap_model(self, new_path):
+        """Hot-swap the YOLO weights without restarting the app.
+
+        Reloads the primary model and drops every per-stream model so the
+        next detect() call picks up the new weights everywhere. Tracker
+        state is reset as a side effect (BoT-SORT can't carry across a
+        model change). Returns the resolved path actually loaded.
+        """
+        from ultralytics import YOLO
+        self.model = YOLO(new_path)
+        self._model_path = new_path
+        self._stream_models = {}
+        return new_path
+
     def detect(self, frame, stream_id="default"):
         """
         Detect all green and purple balls in a frame using YOLOv8.
@@ -77,21 +119,42 @@ class YOLODetector:
             raw_pattern: this frame's raw pattern string
             masks: empty dict (YOLO doesn't produce color masks)
         """
+        # Pre-process: boost green saturation so lighter green balls
+        # produce higher confidence detections from YOLO.
+        enhanced = _boost_green(frame)
+
+        tracker_cfg = getattr(config, "YOLO_TRACKER_CONFIG", "botsort.yaml")
+        use_tta = bool(getattr(config, "YOLO_TTA", False))
+
+        # Native sampling: pick imgsz to match the input frame's longest
+        # side, rounded up to the nearest multiple of 32 (YOLO's stride),
+        # capped by config.YOLO_MAX_IMGSZ. This way ultralytics letterboxes
+        # to a square that preserves all the input pixels (no internal
+        # downscale wasting HD detail). Cost scales with imgsz².
+        h_in, w_in = enhanced.shape[:2]
+        target = ((max(h_in, w_in) + 31) // 32) * 32
+        cap = int(getattr(config, "YOLO_MAX_IMGSZ", 1280))
+        imgsz = max(320, min(target, cap))
+
         if self.tracking_enabled:
             model = self._get_stream_model(stream_id)
             results = model.track(
-                frame,
+                enhanced,
                 conf=self.confidence,
                 iou=self.iou_threshold,
-                tracker="botsort.yaml",
+                imgsz=imgsz,
+                tracker=tracker_cfg,
                 persist=True,
+                augment=use_tta,
                 verbose=False,
             )
         else:
             results = self.model.predict(
-                frame,
+                enhanced,
                 conf=self.confidence,
                 iou=self.iou_threshold,
+                imgsz=imgsz,
+                augment=use_tta,
                 verbose=False,
             )
 
@@ -130,6 +193,29 @@ class YOLODetector:
                     "confidence": conf,
                     "track_id": tid,
                 })
+
+        # Per-class confidence filter: green gets a lower bar than purple
+        # because the model is less confident on lighter-colored balls.
+        per_class = getattr(config, 'YOLO_CONF_PER_CLASS', None)
+        if per_class:
+            balls = [b for b in balls
+                     if b["confidence"] >= per_class.get(b["color"], 0)]
+
+        # Position-dependent confidence: far end of the ROI (top of crop,
+        # near the gate) has smaller balls → accept lower confidence there.
+        # Near end (bottom) stays strict to avoid false positives.
+        far_frac = getattr(config, 'YOLO_FAR_REGION_FRACTION', 0)
+        if far_frac > 0:
+            h_frame = frame.shape[0]
+            conf_far = getattr(config, 'YOLO_CONF_FAR', self.confidence)
+            conf_near = getattr(config, 'YOLO_CONF_NEAR', self.confidence)
+            filtered = []
+            for b in balls:
+                y_frac = b["center_y"] / h_frame
+                threshold = conf_far if y_frac < far_frac else conf_near
+                if b["confidence"] >= threshold:
+                    filtered.append(b)
+            balls = filtered
 
         # Sort left to right
         balls.sort(key=lambda b: b["center_x"])

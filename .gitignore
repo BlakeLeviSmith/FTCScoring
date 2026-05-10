@@ -6,4 +6,5 @@ training/images/train/*.jpg
 training/images/val/*.jpg
 training/labels/train/*.txt
 training/labels/val/*.txt
+training/_source_v*/
 

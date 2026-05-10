@@ -98,6 +98,47 @@ class SimpleCountTracker:
         # Cumulative overflow commits.
         self.overflow_total = 0
 
+        # Cumulative classified counter via PEAK + VERIFIED EXITS model:
+        #   classified_total = peak_smoothed_count_ever + verified_exits
+        # An exit is "verified" when a ball that was inside the exit zone
+        # disappears for sustained frames (sustained = past hysteresis).
+        # This means YOLO flicker (ball lost for 5 frames then re-found)
+        # cannot inflate classified_total — only real physical entries
+        # (peak rises) and real physical exits (exit-zone activity) move
+        # the counter.
+        self.classified_total = 0
+        self.exited_total = 0
+        self._peak_smoothed = 0
+        self._pending_count = 0
+        self._pending_count_frames = 0
+        self._stable_change_frames = 8  # how many frames a new count must hold
+
+        # Exit event log — used by the UI to show "Ball exited" notices.
+        # Each entry: {frame, t (unix sec), color, alliance_inferred}
+        self._exit_events = []
+        self._max_exit_events = 50  # ring buffer
+
+        # Recent exit-zone activity (track_ids that visited the exit zone).
+        # Used to associate a count drop with a likely color/track.
+        # entry: {tid, color, last_seen_frame}
+        self._exit_zone_recent = {}
+        self._exit_zone_memory_frames = 30  # ~2s at 15fps
+
+        # Tracks currently/recently visible inside the exit zone — when one
+        # disappears past hysteresis, that's a verified exit. To avoid
+        # phantom exits from balls grazing the edge of the zone for a
+        # single frame, we require a track to be IN the exit zone for
+        # `_min_exit_zone_frames` consecutive frames AND have existed for
+        # `_min_track_lifetime_frames` total before its disappearance is
+        # eligible to count as an exit.
+        # entry: {color, last_seen_frame, in_zone_count, first_seen, exited}
+        self._tracks_in_exit_zone = {}
+        self._min_exit_zone_frames = 3       # ball must "settle" in exit zone
+        self._min_track_lifetime_frames = 10 # short-lived tracks are noise
+
+        # Snapshot at AUTO→TELEOP handoff (for per-phase score display)
+        self._auto_snapshot = None
+
     # ------------------------------------------------------------------
     # Configuration
     # ------------------------------------------------------------------
@@ -126,14 +167,27 @@ class SimpleCountTracker:
         self._frame_idx = 0
         self._classified_slots = []
         self._slots_locked = False
+        self.classified_total = 0
+        self.exited_total = 0
+        self._peak_smoothed = 0
+        self._pending_count = 0
+        self._pending_count_frames = 0
+        self._exit_events = []
+        self._exit_zone_recent = {}
+        self._tracks_in_exit_zone = {}
+        self._auto_snapshot = None
         self._active_passes = {}
         self._next_pass_id = 1
         self._recently_committed = []
         self.overflow_total = 0
 
     def handoff_phase(self):
-        """AUTO → TELEOP handoff. Keep slots locked; nothing to reset."""
-        pass
+        """AUTO → TELEOP handoff. Snapshot cumulative totals for display."""
+        self._auto_snapshot = {
+            "classified_total": self.classified_total,
+            "overflow_total": self.overflow_total,
+            "exited_total": self.exited_total,
+        }
 
     # ------------------------------------------------------------------
     # Per-frame update
@@ -144,21 +198,200 @@ class SimpleCountTracker:
             return [], []
 
         self._frame_idx += 1
+        import time as _time
         h, w = frame_shape[:2]
         balls_in_roi = [b for b in (balls or [])
                         if self._in_region(b, self.roi, w, h)]
         colored = [b for b in balls_in_roi
                    if b.get("color") in ("G", "P")]
 
-        self._count_hist.append(len(colored))
-        self._last_sequence = [b["color"] for b in colored]
+        # Split balls by zone tag (set upstream by the dual-YOLO inference).
+        # Balls without a zone tag fall back to "classified" (legacy single-pass).
+        classified_balls = [b for b in colored if b.get("zone", "classified") == "classified"]
+        overflow_balls = [b for b in colored if b.get("zone") == "overflow"]
+
+        # Live count + sequence track only CLASSIFIED zone balls — so overflow
+        # balls rolling through the upper zone don't inflate the count or
+        # shift the pattern.
+        self._count_hist.append(len(classified_balls))
+        self._last_sequence = [b["color"] for b in classified_balls]
         self._last_balls_in_roi = balls_in_roi
 
+        # Watch the exit zone for balls about to leave. Track which
+        # track_ids (and colors) are currently visible inside the exit
+        # polygon. We use this to:
+        #   1. Color-tag exit events when count drops
+        #   2. Verify count drops are real exits vs detector misses
+        if self.exit_zone:
+            for b in colored:
+                if self._in_region(b, self.exit_zone, w, h):
+                    tid = b.get("track_id")
+                    self._exit_zone_recent[tid if tid is not None else
+                                           f"_{b['center_x']}_{b['center_y']}"] = {
+                        "color": b["color"],
+                        "last_seen_frame": self._frame_idx,
+                    }
+            # Prune stale exit-zone entries
+            cutoff = self._frame_idx - self._exit_zone_memory_frames
+            self._exit_zone_recent = {
+                k: v for k, v in self._exit_zone_recent.items()
+                if v["last_seen_frame"] >= cutoff
+            }
+
+        # ---- Update peak (with hysteresis) ----
+        smoothed = self._smoothed_count()
+        if smoothed != self._pending_count:
+            self._pending_count = smoothed
+            self._pending_count_frames = 1
+        else:
+            self._pending_count_frames += 1
+
+        if self._pending_count_frames >= self._stable_change_frames:
+            if self._pending_count > self._peak_smoothed:
+                # Count rose to a new high — that many new balls entered
+                self.classified_total += (self._pending_count - self._peak_smoothed)
+                self._peak_smoothed = self._pending_count
+
+        # ---- Verify exits via exit-zone track disappearance ----
+        # Each frame, find tracks currently in exit zone. Update their
+        # last-seen. Any track that hasn't been seen for hysteresis frames
+        # AND was previously in the zone = confirmed exit. This means
+        # YOLO losing a ball mid-ramp doesn't trigger an exit — only a
+        # ball that physically passed through the exit zone before
+        # disappearing.
+        if self.exit_zone:
+            seen_tids = set()
+            for b in classified_balls + overflow_balls:
+                if not self._in_region(b, self.exit_zone, w, h):
+                    continue
+                tid = b.get("track_id") or f"_{int(b['center_x'])}_{int(b['center_y'])}"
+                seen_tids.add(tid)
+                if tid in self._tracks_in_exit_zone:
+                    rec = self._tracks_in_exit_zone[tid]
+                    rec["color"] = b["color"]
+                    rec["last_seen_frame"] = self._frame_idx
+                    rec["in_zone_count"] = rec.get("in_zone_count", 0) + 1
+                else:
+                    self._tracks_in_exit_zone[tid] = {
+                        "color": b["color"],
+                        "first_seen": self._frame_idx,
+                        "last_seen_frame": self._frame_idx,
+                        "in_zone_count": 1,
+                        "exited": False,
+                    }
+
+            # An exit is "confirmed" only if the track:
+            #   1. Was inside the exit zone for at least N consecutive frames
+            #      (filters out balls that grazed the zone boundary)
+            #   2. Existed for at least M frames total
+            #      (filters short-lived spurious tracks from YOLO noise)
+            #   3. Has been gone for at least the stability window
+            confirmed_exits = []
+            for tid, info in list(self._tracks_in_exit_zone.items()):
+                if info["exited"]:
+                    continue
+                if tid in seen_tids:
+                    continue
+                age_gone = self._frame_idx - info["last_seen_frame"]
+                if age_gone < self._stable_change_frames:
+                    continue
+                if info["in_zone_count"] < self._min_exit_zone_frames:
+                    info["exited"] = True  # mark to skip, not a real exit
+                    continue
+                lifetime = info["last_seen_frame"] - info["first_seen"] + 1
+                if lifetime < self._min_track_lifetime_frames:
+                    info["exited"] = True
+                    continue
+                info["exited"] = True
+                confirmed_exits.append(info)
+
+            for info in confirmed_exits:
+                self.exited_total += 1
+                if self._peak_smoothed > 0:
+                    self._peak_smoothed -= 1
+                self._exit_events.append({
+                    "frame": self._frame_idx,
+                    "t": _time.time(),
+                    "color": info["color"],
+                })
+                if len(self._exit_events) > self._max_exit_events:
+                    self._exit_events.pop(0)
+
+            # Prune very old exit-zone entries
+            cutoff_old = self._frame_idx - self._exit_zone_memory_frames * 4
+            self._tracks_in_exit_zone = {
+                k: v for k, v in self._tracks_in_exit_zone.items()
+                if v["last_seen_frame"] >= cutoff_old
+            }
+
+        # Lock the 9 spatial slots (used for pattern matching) once we
+        # have stably seen 9 balls — only classified-zone balls count.
         if not self._slots_locked:
-            self._maybe_lock_slots(colored, w, h)
-        self._update_overflow_passes(colored, w, h)
+            self._maybe_lock_slots(classified_balls, w, h)
+
+        # Overflow passes — only run on overflow-zone balls. They're
+        # already pre-filtered to the overflow side, so no divider math
+        # needed. Skip if the dual-zone inference isn't tagging.
+        if overflow_balls:
+            self._update_overflow_passes_zoned(overflow_balls, w, h)
+        elif self.divider is not None:
+            # Fallback to legacy divider-based path if zone tags missing
+            self._update_overflow_passes(colored, w, h)
 
         return list(self._last_sequence), balls_in_roi
+
+    def _update_overflow_passes_zoned(self, overflow_balls, w, h):
+        """Process overflow-zone balls (pre-filtered upstream).
+
+        Each detection is matched to an active pass or starts a new one.
+        Active passes that haven't been updated for `pass_gap_frames` are
+        committed to overflow_total. No divider math needed since the
+        balls were already isolated by the dual-YOLO inference.
+        """
+        match_radius = self.pass_match_radius_norm * (w + h) / 2.0
+        axis = self._gate_to_exit_axis(w, h)
+
+        eligible = []
+        for b in overflow_balls:
+            px = b.get("center_x", 0)
+            py = b.get("center_y", 0)
+            if axis is not None:
+                t = self._project_axis_fraction(px, py, axis)
+                if t < self.overflow_start_fraction:
+                    continue
+            eligible.append((b, (px, py)))
+
+        # One-to-one assignment (same logic as legacy _update_overflow_passes)
+        claimed = set()
+        unmatched = list(range(len(eligible)))
+        while unmatched:
+            best = None
+            for di in unmatched:
+                ball, pos = eligible[di]
+                color = ball.get("color", "")
+                for pid, info in self._active_passes.items():
+                    if pid in claimed or info["color"] != color:
+                        continue
+                    d = _dist(pos, info["last_pos_px"])
+                    if d > match_radius:
+                        continue
+                    if best is None or d < best[0]:
+                        best = (d, di, pid)
+            if best is None:
+                break
+            _d, di, pid = best
+            ball, pos = eligible[di]
+            info = self._active_passes[pid]
+            info["last_pos_px"] = pos
+            info["last_frame"] = self._frame_idx
+            claimed.add(pid)
+            unmatched.remove(di)
+
+        for di in unmatched:
+            ball, pos = eligible[di]
+            self._start_new_pass_or_suppress(ball, pos, match_radius)
+
+        self._commit_expired_passes()
 
     # ------------------------------------------------------------------
     # Slot lock (for pattern scoring)
@@ -389,22 +622,30 @@ class SimpleCountTracker:
         return int(s[len(s) // 2])
 
     def get_totals(self):
-        classified = (len(self._classified_slots)
-                      if self._slots_locked
-                      else self._smoothed_count())
-        # Active (not-yet-committed) passes count toward the live display
-        # so overflow ticks up while a ball is still crossing the zone.
-        # They're only added to `overflow_total` once they expire.
+        # Live count = smoothed median of the last N frames (~1s).
+        live = self._smoothed_count()
+
+        # Active (not-yet-committed) passes count toward live overflow so
+        # the UI updates in real time while a ball is crossing the zone.
         active = sum(
             1 for info in self._active_passes.values()
             if (self._frame_idx - info["first_frame"] + 1) >= self.pass_min_frames
         )
         return {
-            "classified": classified,
+            # Cumulative classified entries — increments when count goes up.
+            "classified": self.classified_total,
+            # Live count of what's on the ramp right now (smoothed).
+            "occupancy": live,
+            # Cumulative overflow — committed passes + live in-flight ones.
             "overflow": self.overflow_total + active,
-            "exited": 0,
-            "occupancy": classified,
+            # How many balls have left over the course of the match.
+            "exited": self.exited_total,
         }
+
+    def get_exit_events(self, since_frame=0):
+        """Return exit events more recent than `since_frame`. Used by the
+        dashboard to show a 'Ball exited' notification log."""
+        return [e for e in self._exit_events if e["frame"] > since_frame]
 
     def get_sequence(self):
         return list(self._last_sequence)

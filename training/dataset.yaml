@@ -16,7 +16,7 @@
 #   0 0.45 0.62 0.03 0.04
 #   1 0.52 0.61 0.03 0.04
 
-path: .  # Resolved to absolute path by train.py at runtime
+path: .  # resolved relative to train.py working directory
 train: images/train
 val: images/val
 
