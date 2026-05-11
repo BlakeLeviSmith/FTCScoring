@@ -47,7 +47,11 @@ REPLAY_TARGET_HEIGHT = 720
 #   ESP32 q=18 ≈ OpenCV q=60   (current default — matches ESP32_DEFAULT_QUALITY)
 #   ESP32 q=30 ≈ OpenCV q=40   (very lossy)
 # Tune until the replay artifacts look like the live stream.
-REPLAY_SIMULATE_LIVE_COMPRESSION = False
+# Default ON because ftc_motion_v2 was trained with ImageCompression
+# augmentation in the pipeline — turning sim OFF means the model sees
+# *cleaner* input than it was trained on (which actually hurts accuracy
+# because the model expects MJPEG artifacts in the wild).
+REPLAY_SIMULATE_LIVE_COMPRESSION = True
 REPLAY_SIM_JPEG_QUALITY = 60
 
 # ============= MOTIFS =============
@@ -92,9 +96,22 @@ POINTS_DEPOT = 1
 # The rest (per-class threshold, far-region split, custom tracker yaml,
 # green boost) are disabled here — flip them on individually below as
 # you re-introduce each helper.
-YOLO_MODEL_PATH = "training/runs/detect/ftc_motion_v1/weights/best.pt"
-YOLO_CONFIDENCE = 0.25             # standard YOLO confidence (was 0.08 + secondary filters)
-YOLO_IOU_THRESHOLD = 0.45
+YOLO_MODEL_PATH = "training/runs/detect/ftc_motion_v2/weights/best.pt"
+# YOLO_CONFIDENCE is the FIRST-PASS filter applied at detection time.
+# Anything below this NEVER reaches ByteTrack. Keep it LOW (~0.05) so
+# ByteTrack's recovery-pass (track_low_thresh in bytetrack_ftc.yaml,
+# default 0.10) actually has weak detections to work with — that's
+# what saves a track during a low-confidence frame instead of letting
+# it die. Higher values here defeat the whole point of ByteTrack's
+# two-pass matching.
+YOLO_CONFIDENCE = 0.05
+# NMS IoU threshold — pairs of detections whose IoU exceeds this get the
+# lower-confidence one suppressed. Higher = less aggressive suppression
+# = touching balls (which overlap a lot) BOTH survive instead of one
+# being killed. 0.45 is a generic default; for densely-packed objects
+# like our balls 0.7 leaves real ball-pairs alone while still killing
+# spurious duplicate boxes on a single ball.
+YOLO_IOU_THRESHOLD = 0.85
 
 # Cap on the YOLO inference imgsz. We feed the ROI crop natively (no
 # forced square resize) and ultralytics picks imgsz = next multiple of
@@ -121,31 +138,59 @@ YOLO_CONF_NEAR = 0.12
 # results. Off in baseline. ~3× per inference call.
 YOLO_TTA = False
 
-# BoT-SORT tracker config. "botsort.yaml" is the ultralytics stock file.
-# Switch to "botsort_ftc.yaml" once we want looser thresholds + longer
-# track_buffer for moving-ball ReID.
-YOLO_TRACKER_CONFIG = "botsort.yaml"
+# Tracker config passed to ultralytics' model.track(). Each per-stream
+# tracker maintains track_id continuity frame-to-frame; the tripwire
+# counter then just counts unique track_ids that crossed each zone.
+#
+# Options:
+#   "bytetrack_ftc.yaml" (default) — ByteTrack with tuned thresholds.
+#                                     Two-pass matching recovers tracks
+#                                     during low-confidence frames.
+#   "botsort_ftc.yaml"             — BoT-SORT with our tunes.
+#   "bytetrack.yaml" / "botsort.yaml" — ultralytics stock defaults.
+YOLO_TRACKER_CONFIG = "bytetrack_ftc.yaml"
 
 # Green saturation/value boost (0 = disabled — stock baseline).
 GREEN_SAT_BOOST = 0
 GREEN_VAL_BOOST = 0
 
 # ============= TRIPWIRE COUNTER =============
-# Velocity-projected matching: each frame, every active track's position
-# is projected forward using its last known velocity, and new detections
-# within TRIPWIRE_MATCH_RADIUS_PX of any projection are treated as the
-# same ball continuing (no new count). Unmatched detections start a new
-# track and increment the count by 1.
-#   - Smaller radius → over-count (one fast ball gets split into multiple)
-#   - Larger radius  → under-count (two distinct balls merged into one)
-#   - Aim for ~1 ball diameter at full HD (typically 30–50 px).
-TRIPWIRE_MATCH_RADIUS_PX = 40
+# Track-ID-based counting. Each frame, ultralytics' tracker
+# (ByteTrack/BoT-SORT, see YOLO_TRACKER_CONFIG above) assigns a
+# persistent track_id to every detection. Tripwires just record the
+# set of unique track_ids ever seen inside their polygon, and the
+# count is len(seen_ids).
+#
+# All inter-frame association is delegated to the ByteTrack/BoT-SORT
+# Kalman filter + Hungarian matching + low-confidence-recovery — no
+# velocity gates, bounce radii, etc. needed at this layer.
+#
+# How long to remember a seen track_id (frames). After this many
+# frames since last seen, the id is forgotten so a re-issued id (e.g.
+# after the source ball physically left and ByteTrack recycled the
+# number) can register as a fresh count. At 30fps, 600 frames = 20s,
+# longer than any plausible "ball that's still in flight."
+TRIPWIRE_TRACK_MEMORY_FRAMES = 600
 
-# Frames a track survives without a detection update before being
-# retired. Bridges short YOLO drops mid-pass. At 15fps:
-#   3 = 0.2s (current default, generous enough for a 1-frame blink)
-#   1 = strict (any drop = new track on re-detect)
-TRIPWIRE_MAX_MISSES = 3
+# Trail visualization (debug overlay): how many recent positions to
+# remember per active track for drawing the polyline trail. ~30 frames
+# at 30fps = 1s of motion history per track.
+TRIPWIRE_TRAIL_LENGTH = 30
+
+# Track maturity requirement: a track must have been visible (anywhere
+# in the ROI) for at least this many frames before its appearance in a
+# tripwire counts. Bridges the case where ByteTrack assigns a tentative
+# track_id on the very first detection of a ball — that id may be
+# revised in the next 1-2 frames as the tracker promotes it from
+# "tentative" to "tracked." Counting only after N frames lets the id
+# stabilize first.
+#
+# At 30fps:
+#   1 = no maturity requirement (current ByteTrack behavior)
+#   3 = wait 100ms (~6 frames at 60fps replay) — light requirement
+#   5 = wait 167ms — recommended for balls that come straight out of
+#       the goal and are immediately at the tripwire
+TRIPWIRE_MIN_TRACK_AGE_FRAMES = 5
 
 # ============= TEMPORAL SMOOTHING =============
 STABLE_HISTORY_SIZE = 10

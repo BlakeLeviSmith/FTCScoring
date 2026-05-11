@@ -673,10 +673,10 @@
                             </div>
                             <div class="replay-speed-row">
                                 <span class="replay-speed-label">PLAYBACK</span>
-                                <button class="roi-btn" onclick="adjustReplaySpeed(0.5)" title="Halve playback speed">½×</button>
-                                <button class="roi-btn" onclick="setReplaySpeed(15)" title="Reset to 15 fps (default)">1×</button>
-                                <button class="roi-btn" onclick="adjustReplaySpeed(2.0)" title="Double playback speed">2×</button>
-                                <span class="replay-speed-current" id="replay-speed-current">15 fps</span>
+                                <button class="roi-btn" onclick="setSourceSpeedMultiplier(0.5)" title="Half real-time">½×</button>
+                                <button class="roi-btn" onclick="setSourceSpeedMultiplier(1.0)" title="Real time (matches source fps)">1×</button>
+                                <button class="roi-btn" onclick="setSourceSpeedMultiplier(2.0)" title="Twice real-time">2×</button>
+                                <span class="replay-speed-current" id="replay-speed-current">30 fps</span>
                             </div>
                             <div style="margin-top:10px; font-size:0.72rem; color:#666;" id="replay-status">
                                 Select a clip, draw your zones, then click START MATCH.
@@ -686,38 +686,34 @@
                 </div>
 
                 <div style="margin-top: 12px; display: flex; flex-direction: column; gap: 12px;">
-                    <details class="collapsible">
-                        <summary>CAMERA &amp; PERFORMANCE</summary>
-                        <div class="detail-body">
-                            <div class="cam-grid">
-                                <div class="cam-ctrl">
-                                    <label>Resolution</label>
-                                    <select id="cam-resolution" onchange="setCamSetting('framesize', this.value)">
-                                        <option value="4">QVGA (320x240)</option>
-                                        <option value="5">CIF (400x296)</option>
-                                        <option value="6" selected>VGA (640x480)</option>
-                                        <option value="7">SVGA (800x600)</option>
-                                        <option value="8">XGA (1024x768)</option>
-                                    </select>
-                                </div>
-                                <div class="cam-ctrl">
-                                    <label>JPEG Quality (<span id="quality-val">12</span>)</label>
-                                    <input type="range" id="cam-quality" min="8" max="50" value="12"
-                                           oninput="document.getElementById('quality-val').textContent=this.value"
-                                           onchange="setCamSetting('quality', this.value)">
-                                </div>
-                            </div>
-                        </div>
-                    </details>
-
                     <details class="collapsible" open>
                         <summary>TRIPWIRE TUNING + DEBUG</summary>
                         <div class="detail-body">
                             <div class="param-row">
-                                <label title="Velocity-projected matching radius. A new detection within this many pixels of a track's predicted position counts as the same ball (no new count). Smaller = more counts (potential over-count). Larger = fewer counts (potential under-count). Aim for ~1 ball diameter.">Trip radius (px)</label>
-                                <input type="range" min="5" max="200" step="5" id="tune-trip-radius"
-                                       oninput="updateRawVal(this); pushTuning()" value="40">
-                                <span class="param-val" id="tune-trip-radius-val">40</span>
+                                <label title="Hot-swap the YOLO model. Lists every training run with a best.pt under training/runs/detect/. Takes effect on the next frame, no app restart.">Model</label>
+                                <select id="tune-model" onchange="pushTuning()" style="max-width:200px;"></select>
+                            </div>
+                            <div class="param-row" style="font-size:0.65rem; color:#999; line-height:1.4;">
+                                Inter-frame association is now handled by
+                                <b>ByteTrack</b> via <code>model.track()</code>.
+                                Tripwire counts = unique <code>track_id</code>s that
+                                crossed each zone. Per-track polyline trails are
+                                drawn on the windowed ROI views — long continuous
+                                trail = good tracking; trail color changes mid-pass
+                                = the tracker swapped IDs. Tracker yaml:
+                                <code id="tune-tracker-yaml">bytetrack_ftc.yaml</code>.
+                            </div>
+                            <div class="param-row">
+                                <label title="NMS IoU threshold — pairs of detections whose bounding boxes overlap by MORE than this get the lower-confidence one suppressed. HIGHER = LESS suppression = touching balls survive. 0.85 is good for densely-packed FTC balls.">NMS IoU</label>
+                                <input type="range" min="20" max="95" step="5" id="tune-yolo-iou"
+                                       oninput="updateIouVal(this); pushTuning()" value="85">
+                                <span class="param-val" id="tune-yolo-iou-val">0.85</span>
+                            </div>
+                            <div class="param-row">
+                                <label title="Track maturity gate — a track must be visible for at least this many frames before its appearance in a tripwire counts. Lets ByteTrack's tentative track_id stabilize before we count it. 1 = no gate, 5 = ~167ms at 30fps. Bump if you see flicker-double-counts on freshly-appearing balls.">Track maturity (frames)</label>
+                                <input type="range" min="1" max="20" step="1" id="tune-min-age"
+                                       oninput="updateRawVal(this); pushTuning()" value="5">
+                                <span class="param-val" id="tune-min-age-val">5</span>
                             </div>
                             <div class="trip-debug-grid">
                                 <div class="trip-debug-col">
@@ -1155,13 +1151,39 @@
         function updateRawVal(el) {
             document.getElementById(el.id + '-val').textContent = el.value;
         }
+        function updateVelVal(el) {
+            // Slider stores 0-40 = 0.0-4.0 (one decimal place precision)
+            document.getElementById(el.id + '-val').textContent = (el.value / 10).toFixed(1);
+        }
+        function updateIouVal(el) {
+            // Slider stores 20-95 = 0.20-0.95
+            document.getElementById(el.id + '-val').textContent = (el.value / 100).toFixed(2);
+        }
 
-        // Initial load — read the current radius from the server
+        // Initial load — populate sliders + model dropdown from server
         fetch('/api/yolo_config').then(r => r.json()).then(c => {
-            const tr = document.getElementById('tune-trip-radius');
-            if (tr && c.tripwire_match_radius_px != null) {
-                tr.value = c.tripwire_match_radius_px;
-                document.getElementById('tune-trip-radius-val').textContent = c.tripwire_match_radius_px;
+            const tycfg = document.getElementById('tune-tracker-yaml');
+            if (tycfg && c.tracker_config) tycfg.textContent = c.tracker_config;
+            const tma = document.getElementById('tune-min-age');
+            if (tma && c.tripwire_min_track_age != null) {
+                tma.value = c.tripwire_min_track_age;
+                document.getElementById('tune-min-age-val').textContent = c.tripwire_min_track_age;
+            }
+            const ti2 = document.getElementById('tune-yolo-iou');
+            if (ti2 && c.iou_threshold != null) {
+                ti2.value = Math.round(c.iou_threshold * 100);
+                document.getElementById('tune-yolo-iou-val').textContent = c.iou_threshold.toFixed(2);
+            }
+            const ms = document.getElementById('tune-model');
+            if (ms) {
+                ms.innerHTML = '';
+                (c.available_models || []).forEach(m => {
+                    const opt = document.createElement('option');
+                    opt.value = m.path;
+                    opt.textContent = m.name;
+                    ms.appendChild(opt);
+                });
+                if (c.model_path) ms.value = c.model_path;
             }
         }).catch(() => {});
 
@@ -1169,12 +1191,16 @@
         function pushTuning() {
             if (tuningPushTimer) clearTimeout(tuningPushTimer);
             tuningPushTimer = setTimeout(() => {
+                const body = {
+                    iou_threshold: +document.getElementById('tune-yolo-iou').value / 100.0,
+                    tripwire_min_track_age: +document.getElementById('tune-min-age').value,
+                };
+                const ms = document.getElementById('tune-model');
+                if (ms && ms.value) body.model_path = ms.value;
                 fetch('/api/yolo_config', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({
-                        tripwire_match_radius_px: +document.getElementById('tune-trip-radius').value,
-                    })
+                    body: JSON.stringify(body)
                 });
             }, 150);
         }
@@ -1820,24 +1846,21 @@
             }).catch(() => {});
         }
 
-        function adjustReplaySpeed(mult) {
+        // Set playback fps as a multiplier of the SOURCE clip's fps,
+        // so 1× is always real time regardless of whether the source
+        // is 24 / 30 / 60 fps. Falls back to 30 fps if source unknown.
+        function setSourceSpeedMultiplier(mult) {
+            const src = (lastReplayStatus && lastReplayStatus.src_fps) || 30;
+            const target = Math.round(src * mult * 10) / 10;
             fetch('/api/replay/speed', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ mult: mult })
+                body: JSON.stringify({ fps: target })
             }).then(r => r.json()).then(d => {
                 const el = document.getElementById('replay-speed-current');
-                if (el && d.playback_fps != null) el.textContent = d.playback_fps + ' fps';
-            }).catch(() => {});
-        }
-        function setReplaySpeed(fps) {
-            fetch('/api/replay/speed', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ fps: fps })
-            }).then(r => r.json()).then(d => {
-                const el = document.getElementById('replay-speed-current');
-                if (el && d.playback_fps != null) el.textContent = d.playback_fps + ' fps';
+                if (el && d.playback_fps != null) {
+                    el.textContent = d.playback_fps + ' fps (' + mult + '× real-time)';
+                }
             }).catch(() => {});
         }
 

@@ -540,7 +540,7 @@ def grab_loop_usb(cap):
 MATCH_FOOTAGE_DIR = os.path.join(os.path.dirname(__file__), "match_footage")
 _replay_current_video = None   # Path to current video being replayed
 _replay_switch_to = None       # Set by API to trigger a video switch
-_replay_target_fps = 15
+_replay_target_fps = 30  # default: 30fps = real-time for typical match footage
 _replay_paused = True          # Start paused so user can set up zones first
 _replay_seek_to = None         # Set by API to trigger a frame seek
 _replay_total_frames = 0       # Total frames in current video
@@ -1025,7 +1025,35 @@ def _process_alliance_roi_crop(frame, roi_poly, tracker, scorer_obj, detector_re
             cv2.polylines(view, [np.array(pts, dtype=np.int32)],
                           True, trip_color, 2, cv2.LINE_AA)
 
-    # Draw detection boxes
+    # ---- Draw per-track polyline trails ----
+    # Each active track's recent positions get connected with a colored
+    # polyline. Same color always = same track id. This is the primary
+    # debug aid for "is the tracker dropping mid-crossing?" — a long
+    # continuous trail = good. Multiple short trails of different colors
+    # for what should be one ball = the tracker swapped/lost the id.
+    if tracker is not None and hasattr(tracker, "get_trails"):
+        try:
+            from tripwire_counter import stable_color_for_tid as _trail_color
+        except ImportError:
+            _trail_color = None
+        if _trail_color is not None:
+            trails = tracker.get_trails()
+            for tid, points in trails.items():
+                if len(points) < 2:
+                    continue
+                color = _trail_color(int(tid))
+                pts_view = []
+                for (x, y, _frame, _c) in points:
+                    cx = int((x - bx) * sx * sx_disp)
+                    cy = int((y - by) * sy * sy_disp)
+                    pts_view.append([cx, cy])
+                cv2.polylines(view, [np.array(pts_view, dtype=np.int32)],
+                              False, color, 2, cv2.LINE_AA)
+                hx, hy = pts_view[-1]
+                cv2.putText(view, f"#{int(tid)}", (hx + 4, hy - 4),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 1, cv2.LINE_AA)
+
+    # Draw detection boxes (with track id if available)
     for b in mapped:
         cx = int((b["x"] - bx) * sx * sx_disp)
         cy = int((b["y"] - by) * sy * sy_disp)
@@ -1033,7 +1061,9 @@ def _process_alliance_roi_crop(frame, roi_poly, tracker, scorer_obj, detector_re
         chb = int(b["h"] * sy * sy_disp)
         color = (0, 255, 0) if b.get("color") == "G" else (200, 0, 200)
         cv2.rectangle(view, (cx, cy), (cx + cwb, cy + chb), color, 2)
-        cv2.putText(view, f"{b.get('color','?')} {b.get('confidence',0):.2f}",
+        tid = b.get("track_id")
+        tid_str = f" #{tid}" if tid is not None else ""
+        cv2.putText(view, f"{b.get('color','?')}{tid_str} {b.get('confidence',0):.2f}",
                     (cx, max(cy - 4, 10)), cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1)
 
     return mapped, stable_pattern, raw_pattern, view
@@ -1767,8 +1797,10 @@ def api_yolo_config():
         "replay_sim_compression": bool(
             getattr(config, "REPLAY_SIMULATE_LIVE_COMPRESSION", False)),
         "replay_sim_quality": int(getattr(config, "REPLAY_SIM_JPEG_QUALITY", 60)),
-        "tripwire_match_radius_px": int(
-            getattr(config, "TRIPWIRE_MATCH_RADIUS_PX", 40)),
+        "iou_threshold": float(getattr(config, "YOLO_IOU_THRESHOLD", 0.85)),
+        "tracker_config": str(getattr(config, "YOLO_TRACKER_CONFIG", "bytetrack_ftc.yaml")),
+        "tripwire_min_track_age": int(
+            getattr(config, "TRIPWIRE_MIN_TRACK_AGE_FRAMES", 5)),
     })
 
 
@@ -1799,13 +1831,12 @@ def api_set_yolo_config():
         config.REPLAY_SIMULATE_LIVE_COMPRESSION = bool(data["replay_sim_compression"])
     if "replay_sim_quality" in data:
         config.REPLAY_SIM_JPEG_QUALITY = int(data["replay_sim_quality"])
-    if "tripwire_match_radius_px" in data:
-        v = max(5, min(300, int(data["tripwire_match_radius_px"])))
-        config.TRIPWIRE_MATCH_RADIUS_PX = v
-        # Push into the live trackers so the change takes effect immediately.
+    if "tripwire_min_track_age" in data:
+        v = max(1, min(60, int(data["tripwire_min_track_age"])))
+        config.TRIPWIRE_MIN_TRACK_AGE_FRAMES = v
         for t in (ramp_tracker_red, ramp_tracker_blue):
-            if t is not None and hasattr(t, "set_match_radius"):
-                t.set_match_radius(v)
+            if t is not None and hasattr(t, "set_min_track_age"):
+                t.set_min_track_age(v)
     if "model_path" in data:
         new_path = data["model_path"]
         # Resolve relative paths against the project root so the dropdown
@@ -2410,7 +2441,7 @@ if __name__ == "__main__":
                              "RampTracker with classified/overflow bookkeeping)")
     parser.add_argument("--replay", default=None, metavar="VIDEO",
                         help="Replay a video file through the dashboard (downscaled to ESP32 quality)")
-    parser.add_argument("--replay-fps", type=int, default=15,
+    parser.add_argument("--replay-fps", type=int, default=30,
                         help="Replay FPS (default: 15, similar to ESP32 stream)")
     parser.add_argument("--no-loop", action="store_true",
                         help="Don't loop the replay video")
@@ -2495,14 +2526,13 @@ if __name__ == "__main__":
     try:
         from tripwire_counter import TripwireCounter as _Tracker
         tracker_mode = "TRIPWIRE (event-based gate + overflow counting)"
-        ramp_tracker_red = _Tracker(
-            match_radius_px=int(getattr(config, "TRIPWIRE_MATCH_RADIUS_PX", 40)),
-            max_misses=int(getattr(config, "TRIPWIRE_MAX_MISSES", 3)),
+        _tk_kwargs = dict(
+            memory_frames=int(getattr(config, "TRIPWIRE_TRACK_MEMORY_FRAMES", 600)),
+            trail_length=int(getattr(config, "TRIPWIRE_TRAIL_LENGTH", 30)),
+            min_track_age_frames=int(getattr(config, "TRIPWIRE_MIN_TRACK_AGE_FRAMES", 5)),
         )
-        ramp_tracker_blue = _Tracker(
-            match_radius_px=int(getattr(config, "TRIPWIRE_MATCH_RADIUS_PX", 40)),
-            max_misses=int(getattr(config, "TRIPWIRE_MAX_MISSES", 3)),
-        )
+        ramp_tracker_red = _Tracker(**_tk_kwargs)
+        ramp_tracker_blue = _Tracker(**_tk_kwargs)
         print(f"  Tracker: {tracker_mode}")
         # Load saved ROI/tripwire config for each alliance
         roi_data = load_roi_config()

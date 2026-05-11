@@ -91,16 +91,14 @@ def patch_albumentations_for_motion():
             T = [
                 A.Blur(p=0.01),
                 A.MedianBlur(blur_limit=(3, 7), p=0.10),
-                # Long, ASYMMETRIC streaks — real footage of fast balls
-                # shows trailing motion blur (the ball leaves a streak
-                # behind it as it moves). Default direction_range
-                # (-1.0, 1.0) is symmetric, which makes balls look like
-                # they're vibrating in place. (0.3, 1.0) biases toward
-                # trailing blur. blur_limit up to 41 reaches the streak
-                # lengths we see on the fastest balls in match footage.
-                A.MotionBlur(blur_limit=(11, 41),
+                # Aggressive asymmetric streaks for v3. blur_limit max
+                # bumped 51 → 71 — covers the longest streaks visible
+                # on the fastest balls in match footage. p bumped to
+                # 0.60 because real footage shows blurred balls on
+                # >half of "interesting" frames.
+                A.MotionBlur(blur_limit=(21, 71),
                              direction_range=(0.3, 1.0),
-                             p=0.50),
+                             p=0.60),
                 A.ImageCompression(quality_range=(40, 80), p=0.30),
                 A.ToGray(p=0.01),
                 A.CLAHE(p=0.01),
@@ -132,8 +130,9 @@ def main():
                              "architecture, ~3× params of yolov8n)")
     parser.add_argument("--resume", action="store_true",
                         help="Resume interrupted training")
-    parser.add_argument("--name", default="ftc_motion_v2",
-                        help="Run name (default: ftc_motion_v2)")
+    parser.add_argument("--name", default="ftc_motion_v3",
+                        help="Run name (default: ftc_motion_v3 — copy_paste + "
+                             "scale=0.7 + stronger motion blur)")
     parser.add_argument("--no-motion-aug", action="store_true",
                         help="Disable the custom motion-blur augmentation pipeline")
     parser.add_argument("--no-multi-scale", action="store_true",
@@ -247,17 +246,31 @@ def main():
             name=args.name,
             project=os.path.join(training_dir, "runs", "detect"),
 
-            # Augmentation tuned for small ball detection on fixed-camera setup
+            # Augmentation tuned for the v3 retrain. Roboflow training
+            # images have balls CLOSER to the camera (~80px diameter)
+            # than our deployed inference (~30px diameter), so we need
+            # to aggressively downscale + cluster during training.
             flipud=0.0,        # No vertical flip (ramp has fixed orientation)
             fliplr=0.5,        # Horizontal flip OK (left/right alliance)
-            mosaic=0.3,        # Reduced mosaic (balls are small, mosaic can lose them)
+            # Mosaic up from 0.3 → 0.7: more 4-image collages = more
+            # dense cluster scenarios in training.
+            mosaic=0.7,
             mixup=0.0,         # No mixup (confuses small object boundaries)
+            # NEW for v3: copy_paste pastes ball instances from one
+            # training image onto another. Synthesizes the
+            # heavily-overlapping cluster cases the Roboflow dataset
+            # lacks (where the v2 model fails to detect cluster balls).
+            copy_paste=0.5,
             hsv_h=0.015,       # Slight hue variation
             hsv_s=0.5,         # Moderate saturation variation (lighting changes)
             hsv_v=0.4,         # Moderate value variation
             degrees=5.0,       # Slight rotation (camera might be slightly tilted)
             translate=0.1,     # Small translation
-            scale=0.3,         # Moderate scale variation
+            # Scale up from 0.3 → 0.7: random per-image scale of 0.3-1.7×.
+            # Heavy downscales (0.3-0.5×) shrink balls to match the
+            # smaller-on-screen size we see at deployment, where the
+            # camera is far from the ramp.
+            scale=0.7,
 
             # Training params
             patience=20,       # Early stopping patience

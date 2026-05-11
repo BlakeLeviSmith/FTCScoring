@@ -1,0 +1,50 @@
+# ByteTrack tuned for FTC ball detection.
+#
+# ByteTrack's signature trick: it does TWO matching passes per frame.
+#   Pass 1: high-confidence detections matched to active tracks (stable IDs).
+#   Pass 2: LOW-confidence detections used to recover tracks that
+#           weren't matched in pass 1 (catches occluded / motion-blurred
+#           balls that briefly dropped below the high threshold).
+# This is qualitatively better than single-pass matching for the
+# "ball briefly disappears then reappears" failure mode we kept hitting
+# with hand-rolled velocity gates.
+#
+# Reference: https://docs.ultralytics.com/modes/track/#tracker-arguments
+tracker_type: bytetrack
+
+# High-confidence threshold for the first matching pass. Detections
+# above this are treated as the primary anchor for each track.
+# Stock COCO default 0.5; we lower it because our motion-blurred balls
+# legitimately drop into the 0.3-0.5 range.
+track_high_thresh: 0.40
+
+# Low-confidence threshold for the recovery pass. Detections between
+# track_low_thresh and track_high_thresh are used to re-attach tracks
+# that didn't match anything in pass 1 — this is what saves us from
+# losing track of a ball during a low-confidence frame.
+# CRITICAL: must be ≥ YOLO_CONFIDENCE for the recovery band to actually
+# contain anything. With YOLO_CONFIDENCE=0.05, this 0.06 floor means
+# "any detection above 0.06 confidence can be used for recovery,"
+# giving ByteTrack the maximum amount of weak-detection signal.
+track_low_thresh: 0.06
+
+# Confidence required to start a brand-new track. Brand-new tracks
+# need to be reasonably confident or we'll spawn phantom tracks on
+# noise. Keep this around track_high_thresh.
+new_track_thresh: 0.40
+
+# Frames a lost track is kept "alive" for re-association before it's
+# permanently retired. With our reduced confidence floor giving the
+# recovery pass plenty to work with, a longer buffer means tracks can
+# survive even multi-second occlusions if a weak detection appears
+# anywhere along the predicted path. At 30fps:
+#   60  = 2.0 s  (previous)
+#   120 = 4.0 s  (chosen — robot bumps + occlusions can take this long)
+track_buffer: 120
+
+# IoU threshold for Hungarian matching. Higher = more permissive
+# (track stays bound across larger inter-frame motion).
+match_thresh: 0.85
+
+# Fuse detection confidence into the match score (stock default).
+fuse_score: True

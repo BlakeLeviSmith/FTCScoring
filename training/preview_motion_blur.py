@@ -34,29 +34,86 @@ def _load_aug_pipeline_individual():
     import albumentations as A
     # Keep these IN SYNC with the production pipeline in train.py
     # (patch_albumentations_for_motion). Mismatched preview = misleading.
-    MOTION_BLUR_LIMIT = (11, 41)
+    MOTION_BLUR_LIMIT = (21, 71)
     DIRECTION_RANGE = (0.3, 1.0)  # bias toward trailing (asymmetric) blur
     blocks = [
-        ("motion_blur_med",   A.MotionBlur(blur_limit=(15, 21),
+        # Two MotionBlur previews at different streak lengths so you
+        # can see the spread of intensities the trainer samples from.
+        ("motion_blur_med",   A.MotionBlur(blur_limit=(25, 35),
                                            direction_range=DIRECTION_RANGE,
                                            p=1.0)),
-        ("motion_blur_long",  A.MotionBlur(blur_limit=(31, 41),
+        ("motion_blur_long",  A.MotionBlur(blur_limit=(55, 71),
                                            direction_range=DIRECTION_RANGE,
                                            p=1.0)),
+        # NEW for v3: scale-down preview. Shows what an aggressively
+        # downscaled training image looks like — this is what the
+        # trainer's `scale=0.7` produces (~0.3-0.5× scaling). Compare
+        # the apparent ball size here to a real ball in your match
+        # footage to verify the scale matches deployment.
+        ("scale_down_0.4x", _scale_down_preview(0.4)),
+        ("scale_down_0.6x", _scale_down_preview(0.6)),
         ("median_blur",       A.MedianBlur(blur_limit=(3, 7), p=1.0)),
         ("image_compression", A.ImageCompression(quality_range=(40, 80), p=1.0)),
-        ("clahe",             A.CLAHE(p=1.0)),
     ]
-    full = A.Compose([
-        A.Blur(p=0.01),
-        A.MedianBlur(blur_limit=(3, 7), p=0.10),
+    # FULL PIPELINE — combines everything albumentations does PLUS the
+    # scale-down (since ultralytics' `scale=0.7` would do something
+    # similar to ~half the training images). MotionBlur and
+    # ImageCompression both forced on with full intensity so the
+    # preview shows the WORST-case stacked transformation a training
+    # image might see.
+    #
+    # NOTE: this still doesn't show ultralytics' MOSAIC (4-image
+    # collages) or COPY_PASTE (ball instances grafted from one image
+    # onto another). Those happen INSIDE the ultralytics dataloader,
+    # downstream of our albumentations patch. To see those samples,
+    # ultralytics auto-saves train_batch0.jpg / train_batch1.jpg /
+    # train_batch2.jpg to runs/detect/{name}/ at the start of any
+    # training run. Run a quick `python training/train.py --epochs 1`
+    # locally (or wait for the L4 run to start) to see real cluster
+    # samples before the full retrain commits.
+    full_pipeline_with_scale = A.Compose([
+        # Per-image scale-down BEFORE blur, so the blur applies to the
+        # already-shrunk content (mimics what training sees).
+        _ShrinkAndPadCls(0.5, p=1.0),
         A.MotionBlur(blur_limit=MOTION_BLUR_LIMIT,
-                     direction_range=DIRECTION_RANGE, p=1.00),  # forced on
-        A.ImageCompression(quality_range=(40, 80), p=0.50),
-        A.ToGray(p=0.01),
-        A.CLAHE(p=0.01),
+                     direction_range=DIRECTION_RANGE, p=1.00),
+        A.ImageCompression(quality_range=(40, 80), p=1.00),
     ])
-    return [(name, A.Compose([t])) for name, t in blocks] + [("full_pipeline", full)]
+    return [(name, A.Compose([t])) if not isinstance(t, A.Compose) else (name, t)
+            for name, t in blocks] + [
+                ("full_pipeline (scale+blur+compress, ULTRALYTICS mosaic/copy_paste NOT shown)",
+                 full_pipeline_with_scale),
+            ]
+
+
+# Top-level so the full_pipeline Compose can reference it.
+import albumentations as _A_for_class
+class _ShrinkAndPadCls(_A_for_class.ImageOnlyTransform):
+    def __init__(self, scale, p=1.0):
+        super().__init__(p=p)
+        self.scale = scale
+    def apply(self, img, **params):
+        h, w = img.shape[:2]
+        new_h, new_w = int(h * self.scale), int(w * self.scale)
+        small = cv2.resize(img, (new_w, new_h),
+                           interpolation=cv2.INTER_AREA)
+        canvas = np.zeros_like(img)
+        top = (h - new_h) // 2
+        left = (w - new_w) // 2
+        canvas[top:top + new_h, left:left + new_w] = small
+        return canvas
+    def get_transform_init_args_names(self):
+        return ("scale",)
+
+
+def _scale_down_preview(scale_factor):
+    """Compose that downscales the image to scale_factor of its size and
+    pads back to the original with black. Mimics what ultralytics' built-in
+    `scale=0.7` augmentation does to many training images — shrinks the
+    content so apparent ball size matches the smaller-on-screen reality
+    of a deployment camera that's far from the ramp."""
+    import albumentations as A
+    return A.Compose([_ShrinkAndPadCls(scale_factor, p=1.0)])
 
 
 def _stack_with_labels(images, labels, label_h=18):
@@ -182,13 +239,23 @@ def write_index_html(synthetic_paths, real_paths):
  img {{ max-width: 100%; display: block; border: 1px solid #2a2f4a; }}
  .legend {{ background: #14182a; padding: 8px 12px; border-radius: 4px; font-size: 0.85rem; }}
 </style></head><body>
-<h2>Synthetic motion-blur preview (training data)</h2>
+<h2>Synthetic augmentation preview (training data)</h2>
 <div class="legend">
-  Each row: <b>original</b> | each augmentation in isolation | <b>full pipeline</b>
-  (with MotionBlur forced on for visibility — at training time it fires p=0.40).
-  If the synthetic blur visually matches the "real motion frames" below at similar speeds,
-  the augmentation is well-calibrated. If synthetic looks much harsher or much softer than real,
-  tune <code>blur_limit</code> in train.py.
+  Each row: <b>original</b> | each augmentation alone | <b>full_pipeline</b>
+  (scale-down + motion blur + JPEG compression all stacked, every transform forced ON
+  to show worst-case stacking).
+  <br><br>
+  <b style="color:#fb8;">⚠ NOT shown here:</b> ultralytics' <code>mosaic=0.7</code>
+  (4-image collages — synthesizes dense scenes by combining 4 training images into one)
+  and <code>copy_paste=0.5</code> (pastes ball instances from one image onto another —
+  synthesizes overlapping clusters). Those operate INSIDE the ultralytics dataloader,
+  downstream of our albumentations layer.
+  <br><br>
+  To see those samples, ultralytics auto-saves
+  <code>train_batch0.jpg</code> / <code>train_batch1.jpg</code> /
+  <code>train_batch2.jpg</code> to <code>training/runs/detect/&lt;run-name&gt;/</code> at the start
+  of any training run. The L4 retrain will dump these in the first ~30 seconds; we'll
+  pull them back to inspect before letting the full 50 epochs proceed.
 </div>
 {rows_synth}
 <h2 style="margin-top:32px;">Real frames from match footage</h2>
