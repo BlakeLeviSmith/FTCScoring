@@ -1,10 +1,49 @@
+# --- Python ---
 __pycache__/
 *.pyc
+
+# --- OS / editors ---
 .DS_Store
-training/runs/
+
+# --- Large binaries (track separately, not in git) ---
+# Match footage videos (~110 MB each). Acquired from FTC streams; see
+# README.md "Footage" section for sources.
+match_footage/*.mp4
+match_footage/*.mov
+match_footage/*.mkv
+
+# Stock YOLO base weights (downloaded from ultralytics).
+yolo11s.pt
+yolov8n.pt
+
+# Training run outputs. Per-epoch / last.pt checkpoints are huge; the
+# active model (ftc_motion_v2/best.pt = 19 MB) IS tracked. Other
+# trained-model variants (v1, v3, ftc_cpu_final) are gitignored — only
+# the production weights are part of the repo.
+training/runs/**/epoch*.pt
+training/runs/**/last.pt
+training/runs/detect/ftc_cpu_final/
+training/runs/detect/ftc_motion_v1/
+training/runs/detect/ftc_motion_v3/
+
+# Training data (raw labels + images are large; see TRAINING_DATA.md).
 training/images/train/*.jpg
 training/images/val/*.jpg
 training/labels/train/*.txt
 training/labels/val/*.txt
 training/_source_v*/
+training/preview_aug/
+training/preview_motion/
+training/logs/
+training/dataset_resolved.yaml
 
+# --- Beads task tracker (local DB / process state) ---
+.beads/embeddeddolt/
+.beads/backup/
+.beads/dolt-server.*
+
+# --- Runtime debug captures (forensics dumps; not source) ---
+snapshots/
+
+# --- Per-clip backups created by the label flow ---
+labels/*.json.bak
