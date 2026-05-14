@@ -21,4 +21,9 @@ if ! command -v bd >/dev/null 2>&1; then
     exit 0
 fi
 
-exec bd hook pre-commit "$@"
+if bd hook --help >/dev/null 2>&1; then
+    exec bd hook pre-commit "$@"
+else
+    # bd CLI no longer ships the 'hook' subcommand; skip.
+    exit 0
+fi

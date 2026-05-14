@@ -48,12 +48,21 @@ class _Tripwire:
     gone) can register as a fresh count.
     """
 
-    def __init__(self, memory_frames=600):
+    def __init__(self, memory_frames=600, **_unused_legacy):
+        """Counts unique track_ids appearing in the zone.
+
+        Inter-frame tid continuity (CSRT-loss / re-acquire dedup) is
+        handled at the TRACKER level (csrt_tracker.MultiBallTracker)
+        via ghost-track resurrection. This counter is intentionally
+        dumb: it trusts that the same physical ball keeps the same
+        track_id, and just counts distinct ids that crossed the zone.
+
+        `**_unused_legacy` keeps the constructor signature compatible
+        with old callers that still pass settled-registry kwargs.
+        """
         self.memory_frames = memory_frames
         self.count = 0
-        # track_id -> last frame it was seen INSIDE this tripwire
-        self._seen_ids = {}
-        # Detail log so the dashboard can see new-id events
+        self._seen_ids = {}  # tid -> last frame it appeared in zone
         self._events = []
 
     def reset(self):
@@ -62,17 +71,16 @@ class _Tripwire:
         self._events = []
 
     def update(self, balls_in_zone, frame_idx):
-        """Increment count for any track_id appearing in this tripwire
-        for the first time (or after memory expired)."""
+        """Count a track_id the first frame it appears here. Refresh
+        last-seen on subsequent appearances so a brief gap inside
+        memory_frames doesn't recount."""
         for ball in balls_in_zone:
             tid = ball.get("track_id")
             if tid is None:
-                # No id — skip, can't count distinctly. (Happens when
-                # tracker hasn't initialized yet on the first frame.)
                 continue
             prev = self._seen_ids.get(tid)
             if prev is None or (frame_idx - prev) > self.memory_frames:
-                # New entry — count it
+                # New (or memory expired) — count it
                 self.count += 1
                 self._events.append({
                     "frame": frame_idx,
@@ -103,11 +111,18 @@ class TripwireCounter:
     """Per-alliance counter holding both tripwires + trail history."""
 
     def __init__(self, memory_frames=600, trail_length=30,
-                 min_track_age_frames=5):
+                 min_track_age_frames=5,
+                 **_unused_legacy):
         self.roi = None
         self.gate_trip_poly = None
         self.overflow_trip_poly = None
         self._frame_idx = 0
+        # Skip counting (gate AND overflow) until source_frame reaches
+        # this threshold. Used when the early seconds of a clip have an
+        # unstable camera, mid-shot pan, etc. — anything that would fire
+        # spurious counts before the actual gameplay window. 0 = count
+        # from frame 0.
+        self.start_frame = 0
         self.memory_frames = memory_frames
         self.trail_length = trail_length
         # Minimum trail length before a track is allowed to count in
@@ -167,8 +182,17 @@ class TripwireCounter:
         }
 
     # ----- per-frame update -----
-    def update(self, balls, frame_shape):
+    def update(self, balls, frame_shape, source_frame=None):
+        """source_frame: the SOURCE CLIP frame index. When provided
+        (e.g. during replay), events use this instead of the internal
+        counter so they align with ground-truth labels recorded with
+        _replay_current_frame. When None (live camera), the internal
+        counter is used."""
         self._frame_idx += 1
+        # Tripwires log events with `source_frame` if available so they
+        # match the label-mode coordinate system. Internal counter is
+        # the fallback for live camera mode where there's no clip frame.
+        log_frame = int(source_frame) if source_frame is not None else self._frame_idx
         h, w = frame_shape[:2]
         balls = balls or []
 
@@ -230,17 +254,45 @@ class TripwireCounter:
                 return False
             return (self._frame_idx - first + 1) >= min_age
 
-        in_gate = [b for b in balls_in_roi
-                   if _mature(b) and self._point_in_norm_poly(
-                       b.get("center_x", 0), b.get("center_y", 0),
-                       self.gate_trip_poly, w, h)]
-        self.gate_trip.update(in_gate, self._frame_idx)
+        # A ball "transits" a zone if its current position is inside,
+        # OR if the segment from its previous detection to its current
+        # detection crosses any polygon edge. The segment check catches:
+        #   - Fast normal motion that skips over the zone in one frame
+        #   - Ghost-resurrected balls that fell THROUGH the zone while
+        #     undetected (e.g. ball drops past gate during motion blur,
+        #     reappears on the ramp below — its trail's last segment
+        #     goes from above-gate to below-gate, crossing the zone)
+        def _transits(b, poly):
+            cx = b.get("center_x", 0)
+            cy = b.get("center_y", 0)
+            if self._point_in_norm_poly(cx, cy, poly, w, h):
+                return True
+            tid = b.get("track_id")
+            if tid is None:
+                return False
+            trail = self._trails.get(tid)
+            if not trail or len(trail) < 2:
+                return False
+            # trail[-1] was just appended above and == current pos;
+            # trail[-2] is the prior detected position (possibly many
+            # frames ago if CSRT lost & ghost-resurrected the tid).
+            px, py, _, _ = trail[-2]
+            return self._segment_crosses_norm_poly(
+                px, py, cx, cy, poly, w, h)
 
-        in_ovr = [b for b in balls_in_roi
-                  if _mature(b) and self._point_in_norm_poly(
-                      b.get("center_x", 0), b.get("center_y", 0),
-                      self.overflow_trip_poly, w, h)]
-        self.overflow_trip.update(in_ovr, self._frame_idx)
+        # Skip counting entirely while we're before the clip's stable
+        # gameplay window (start_frame). Trackers still get refreshed
+        # so the visual feed and per-track trails work normally, but
+        # no tripwire fires → no inflated counts during camera shifts /
+        # pre-match handling.
+        in_gate, in_ovr = [], []
+        if source_frame is None or source_frame >= self.start_frame:
+            in_gate = [b for b in balls_in_roi
+                       if _mature(b) and _transits(b, self.gate_trip_poly)]
+            in_ovr = [b for b in balls_in_roi
+                      if _mature(b) and _transits(b, self.overflow_trip_poly)]
+        self.gate_trip.update(in_gate, log_frame)
+        self.overflow_trip.update(in_ovr, log_frame)
 
         return [], balls_in_roi
 
@@ -327,6 +379,34 @@ class TripwireCounter:
                 inside = not inside
             j = i
         return inside
+
+    @staticmethod
+    def _segment_crosses_norm_poly(x1, y1, x2, y2, poly, w, h):
+        """True if segment (x1,y1)-(x2,y2) intersects any edge of the
+        polygon. Used for "did the ball pass THROUGH this zone between
+        detections, even if it was never detected INSIDE it" — the
+        gate-drop motion-blur case."""
+        if not poly or len(poly) < 3:
+            return False
+
+        def _ccw(ax, ay, bx, by, cx, cy):
+            return (cy - ay) * (bx - ax) > (by - ay) * (cx - ax)
+
+        def _intersects(ax, ay, bx, by, cx, cy, dx, dy):
+            # Standard segment-segment intersection by orientation.
+            return (_ccw(ax, ay, cx, cy, dx, dy) != _ccw(bx, by, cx, cy, dx, dy)
+                    and _ccw(ax, ay, bx, by, cx, cy) != _ccw(ax, ay, bx, by, dx, dy))
+
+        n = len(poly)
+        for i in range(n):
+            j = (i + 1) % n
+            xa = poly[i][0] * w
+            ya = poly[i][1] * h
+            xb = poly[j][0] * w
+            yb = poly[j][1] * h
+            if _intersects(x1, y1, x2, y2, xa, ya, xb, yb):
+                return True
+        return False
 
 
 def stable_color_for_tid(tid):

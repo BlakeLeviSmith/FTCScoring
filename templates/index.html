@@ -624,6 +624,16 @@
             <span class="status-pill live" id="status-pill">LIVE</span>
             <span class="status-pill fps" id="grab-fps-display" title="Frames from camera">CAM: --</span>
             <span class="status-pill fps" id="proc-fps-display" title="Frames processed by YOLO">YOLO: --</span>
+            <!-- Version probe: shows server csrt_tracker mtime + dedup
+                 marker. If server_has_dedup says NO, restart Python.
+                 If JS_BUILD doesn't match expected, hard-refresh browser.
+                 JS_BUILD is a literal string baked into THIS template
+                 file, so any cached older JS will show a stale value. -->
+            <span class="status-pill fps" id="ver-pill"
+                  title="Code freshness probe — both server + browser must say current.">
+                ver: <span id="ver-server">?</span>
+                · js<span id="ver-js">2026-05-12-snapfix</span>
+            </span>
         </div>
 
         <div class="phase-container">
@@ -634,7 +644,114 @@
         <div class="topbar-right">
             <button class="big-btn" id="start-match-btn" onclick="startMatch()">START MATCH</button>
             <button class="big-btn" id="advance-btn" onclick="advancePhase()" style="display:none; background:#3a6ea5; border-color:#3a6ea5;">END AUTO</button>
+            <!-- FREEZE + Copy snapshot live in the topbar so they're
+                 visible in BOTH setup and match views (the dashboard
+                 swaps the body but keeps the topbar). -->
+            <button class="big-btn" id="freeze-btn" onclick="freezeForDebug()"
+                    style="background:#3a1010; border-color:#c93333; color:#ff8080;"
+                    title="Pauses the replay AND stops all dashboard polling so the snapshot is stable.">⏸ FREEZE</button>
+            <button class="big-btn" onclick="copyDebugSnapshot()"
+                    style="background:#102a3a; border-color:#3cc0ff; color:#7fd8ff;"
+                    title="Copies a full diagnostic dump (active trackers, ghosts, recent events, scores) to your clipboard so you can paste it for review.">📋 Snapshot</button>
             <button class="big-btn reset" onclick="resetAll()">RESET</button>
+        </div>
+    </div>
+
+    <!-- Snapshot output banner: hidden until "📋 Snapshot" is clicked.
+         Lives outside both views so it's visible in setup AND match. -->
+    <textarea id="debug-snapshot-out"
+              style="display:none; width:calc(100% - 16px); margin: 0 8px 12px;
+                     height:240px; font-family:monospace; font-size:0.7rem;
+                     background:#0a0e1a; color:#7fd8ff; border:1px solid #2a2f4a;
+                     padding:6px; border-radius:4px; resize:vertical;"
+              readonly></textarea>
+
+    <!-- LABEL MODE panel: only shown when /api/label/state.label_mode
+         is true. Sits below the topbar, above the views, so it's
+         visible regardless of setup vs match. Hotkeys: Q W A S +/- Z. -->
+    <div id="label-panel" style="display:none; margin: 0 8px 12px;
+                  padding:12px 16px; background:#0d1729; border:2px solid #ffb700;
+                  border-radius:6px;">
+        <div style="display:flex; align-items:center; gap:12px; margin-bottom:8px;">
+            <span style="color:#ffb700; font-weight:600; font-size:1.05em;">
+                📋 LABEL MODE
+            </span>
+            <span id="label-alliance-pill" style="padding:3px 10px;
+                  border-radius:12px; font-weight:600; font-size:0.85em;
+                  background:#2a2f4a; color:#fff;">BOTH</span>
+            <span style="color:#aaa; font-size:0.85em;">
+                clip: <span id="label-video">—</span>
+                · saving to <span id="label-path" style="color:#7fd8ff;">labels/…</span>
+            </span>
+            <span style="margin-left:auto;">
+                <button onclick="resetLabel()"
+                        style="background:#3a1010;color:#ff8080;border:1px solid #c93333;
+                               padding:4px 10px;border-radius:4px;cursor:pointer;
+                               font-family:inherit;font-size:0.85em;">
+                    Reset all counts
+                </button>
+            </span>
+        </div>
+        <div style="display:flex; gap:14px; flex-wrap:wrap;">
+            <!-- RED column -->
+            <div id="label-col-red" style="flex:1; min-width:240px; background:#16213e; padding:10px 12px;
+                        border-radius:6px; border-left:4px solid #e94560;">
+                <div style="color:#e94560; font-weight:600; margin-bottom:6px;">RED ALLIANCE</div>
+                <div style="display:flex; gap:8px; align-items:center; margin:6px 0;">
+                    <span style="flex:1;">Classified <kbd id="label-r-cls-key" style="background:#2a2f4a;padding:1px 6px;border-radius:3px;">Q</kbd></span>
+                    <span id="label-r-cls" style="font-size:1.6em; font-weight:600; color:#fff; min-width:40px; text-align:right;">0</span>
+                    <button onclick="incLabel('red','classified',+1)"
+                            style="background:#e94560;color:#000;border:none;
+                                   padding:6px 14px;border-radius:4px;
+                                   font-weight:700;cursor:pointer;font-size:1em;">+1</button>
+                    <button onclick="incLabel('red','classified',-1)"
+                            style="background:#3a1010;color:#fff;border:1px solid #c93333;
+                                   padding:6px 10px;border-radius:4px;cursor:pointer;">−</button>
+                </div>
+                <div style="display:flex; gap:8px; align-items:center; margin:6px 0;">
+                    <span style="flex:1;">Overflow <kbd id="label-r-ovr-key" style="background:#2a2f4a;padding:1px 6px;border-radius:3px;">W</kbd></span>
+                    <span id="label-r-ovr" style="font-size:1.6em; font-weight:600; color:#fff; min-width:40px; text-align:right;">0</span>
+                    <button onclick="incLabel('red','overflow',+1)"
+                            style="background:#e94560;color:#000;border:none;
+                                   padding:6px 14px;border-radius:4px;
+                                   font-weight:700;cursor:pointer;font-size:1em;">+1</button>
+                    <button onclick="incLabel('red','overflow',-1)"
+                            style="background:#3a1010;color:#fff;border:1px solid #c93333;
+                                   padding:6px 10px;border-radius:4px;cursor:pointer;">−</button>
+                </div>
+            </div>
+            <!-- BLUE column -->
+            <div id="label-col-blue" style="flex:1; min-width:240px; background:#16213e; padding:10px 12px;
+                        border-radius:6px; border-left:4px solid #4560e9;">
+                <div style="color:#7a8eff; font-weight:600; margin-bottom:6px;">BLUE ALLIANCE</div>
+                <div style="display:flex; gap:8px; align-items:center; margin:6px 0;">
+                    <span style="flex:1;">Classified <kbd id="label-b-cls-key" style="background:#2a2f4a;padding:1px 6px;border-radius:3px;">A</kbd></span>
+                    <span id="label-b-cls" style="font-size:1.6em; font-weight:600; color:#fff; min-width:40px; text-align:right;">0</span>
+                    <button onclick="incLabel('blue','classified',+1)"
+                            style="background:#7a8eff;color:#000;border:none;
+                                   padding:6px 14px;border-radius:4px;
+                                   font-weight:700;cursor:pointer;font-size:1em;">+1</button>
+                    <button onclick="incLabel('blue','classified',-1)"
+                            style="background:#101a3a;color:#fff;border:1px solid #3333c9;
+                                   padding:6px 10px;border-radius:4px;cursor:pointer;">−</button>
+                </div>
+                <div style="display:flex; gap:8px; align-items:center; margin:6px 0;">
+                    <span style="flex:1;">Overflow <kbd id="label-b-ovr-key" style="background:#2a2f4a;padding:1px 6px;border-radius:3px;">S</kbd></span>
+                    <span id="label-b-ovr" style="font-size:1.6em; font-weight:600; color:#fff; min-width:40px; text-align:right;">0</span>
+                    <button onclick="incLabel('blue','overflow',+1)"
+                            style="background:#7a8eff;color:#000;border:none;
+                                   padding:6px 14px;border-radius:4px;
+                                   font-weight:700;cursor:pointer;font-size:1em;">+1</button>
+                    <button onclick="incLabel('blue','overflow',-1)"
+                            style="background:#101a3a;color:#fff;border:1px solid #3333c9;
+                                   padding:6px 10px;border-radius:4px;cursor:pointer;">−</button>
+                </div>
+            </div>
+        </div>
+        <div style="margin-top:8px; color:#888; font-size:0.8em;">
+            <span id="label-hotkey-hint">Hotkeys: Q · W · A · S · Z · Space</span>
+            · saves after every click ·
+            <span id="label-events-count">0</span> events recorded
         </div>
     </div>
 
@@ -893,11 +1010,308 @@
                         </div>
                     </div>
                 </div>
+
+                <!-- BENCHMARK card. Auto-shown only when a labels/<clip>.json
+                     exists. Compares the live auto-counter against the
+                     ground-truth events (frame-aligned with ±tolerance) and
+                     surfaces accuracy + the specific GT events that were
+                     missed and the auto events that fired without GT. -->
+                <div class="card tuning-card" id="benchmark-card" style="display:none;">
+                    <div class="card-head">
+                        <span>BENCHMARK <span style="color:#7fd8ff; font-weight:normal; font-size:0.85em;" id="bench-clip">—</span></span>
+                        <span class="hint" style="font-weight:normal;color:#9aa;float:right;">
+                            tol ±
+                            <input type="number" id="bench-tol-input" min="5" max="600" step="5"
+                                   value="150" style="width:60px; background:#0a0e1a;
+                                   color:#7fd8ff; border:1px solid #2a2f4a; padding:1px 4px;
+                                   border-radius:3px;" oninput="onBenchTolChange()">
+                            f (≈ <span id="bench-tol-sec">5.0</span>s)
+                        </span>
+                    </div>
+                    <div class="card-body">
+                        <table id="bench-table" style="width:100%; border-collapse:collapse; font-size:0.85em;">
+                            <thead>
+                                <tr style="color:#888;">
+                                    <th style="text-align:left; padding:4px 8px;">Cell</th>
+                                    <th style="text-align:right; padding:4px 8px;">GT</th>
+                                    <th style="text-align:right; padding:4px 8px;">Auto</th>
+                                    <th style="text-align:right; padding:4px 8px;">TP</th>
+                                    <th style="text-align:right; padding:4px 8px;">FP</th>
+                                    <th style="text-align:right; padding:4px 8px;">FN</th>
+                                    <th style="text-align:right; padding:4px 8px;">Acc</th>
+                                </tr>
+                            </thead>
+                            <tbody id="bench-rows"></tbody>
+                            <tfoot>
+                                <tr style="border-top:2px solid #2a2f4a; font-weight:600;">
+                                    <td style="padding:6px 8px;">TOTAL</td>
+                                    <td style="text-align:right; padding:6px 8px;" id="bench-tot-gt">—</td>
+                                    <td style="text-align:right; padding:6px 8px;" id="bench-tot-auto">—</td>
+                                    <td style="text-align:right; padding:6px 8px;" id="bench-tot-tp">—</td>
+                                    <td style="text-align:right; padding:6px 8px;" id="bench-tot-fp">—</td>
+                                    <td style="text-align:right; padding:6px 8px;" id="bench-tot-fn">—</td>
+                                    <td style="text-align:right; padding:6px 8px;" id="bench-tot-acc">—</td>
+                                </tr>
+                            </tfoot>
+                        </table>
+                        <div style="display:flex; gap:10px; margin-top:10px;">
+                            <div style="flex:1;">
+                                <div style="color:#ff8080; font-size:0.75em; margin-bottom:3px;">MISSED (GT had it, auto didn't)</div>
+                                <div id="bench-missed" style="font-family:monospace; font-size:0.7em; max-height:160px; overflow-y:auto; background:#0a0e1a; padding:6px; border-radius:4px;">none</div>
+                            </div>
+                            <div style="flex:1;">
+                                <div style="color:#ffb700; font-size:0.75em; margin-bottom:3px;">FALSE POS (auto fired, no GT)</div>
+                                <div id="bench-fp" style="font-family:monospace; font-size:0.7em; max-height:160px; overflow-y:auto; background:#0a0e1a; padding:6px; border-radius:4px;">none</div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Per-tid tracker lifecycle (birth, coast, retire,
+                     resurrect, anchor). Use this to spot WHY a specific
+                     ball was missed — e.g. middle ball #7 retires at
+                     f1234 but never gets a `resurrect #7` event, while
+                     #6 (outer) gets `anchor_dist #6 cross_color=1` —
+                     means an outer-color YOLO detection stole the
+                     middle ball's tracker. -->
+                <div class="card tuning-card">
+                    <div class="card-head">
+                        <span>TRACKER ACTIVITY</span>
+                        <span class="hint" style="font-weight:normal;color:#9aa;float:right;">CSRT lifecycle events (per tid)</span>
+                    </div>
+                    <div class="card-body">
+                        <div style="display:flex; gap:6px;">
+                            <div style="flex:1;">
+                                <div style="font-size:0.7rem; color:#e94560; margin-bottom:3px;">RED</div>
+                                <div id="csrt-events-red" style="max-height:280px;overflow-y:auto;font-family:monospace;font-size:0.7rem;">
+                                    <div style="color:#666;padding:4px;">No events yet</div>
+                                </div>
+                            </div>
+                            <div style="flex:1;">
+                                <div style="font-size:0.7rem; color:#7a8eff; margin-bottom:3px;">BLUE</div>
+                                <div id="csrt-events-blue" style="max-height:280px;overflow-y:auto;font-family:monospace;font-size:0.7rem;">
+                                    <div style="color:#666;padding:4px;">No events yet</div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
             </div>
         </div>
     </div>
 
     <script>
+        // ============= FREEZE STATE (declared first so all polls can gate on it) =============
+        let _frozen = false;
+
+        // ============= LABEL MODE =============
+        let _labelMode = false;
+        let _labelAlliance = "both";   // "red" | "blue" | "both"
+        let _lastLabelAction = null;   // for Z-to-undo
+
+        function incLabel(alliance, line, delta) {
+            fetch('/api/label/increment', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({alliance, line, delta}),
+            }).then(r => r.json()).then(d => {
+                if (d.ok) {
+                    if (delta > 0) _lastLabelAction = [alliance, line];
+                    pollLabelState();
+                }
+            });
+        }
+        function resetLabel() {
+            if (!confirm('Reset ALL manual counts for this clip?')) return;
+            fetch('/api/label/reset', {method: 'POST'}).then(pollLabelState);
+        }
+        function pollLabelState() {
+            fetch('/api/label/state').then(r => r.json()).then(d => {
+                _labelMode = !!d.label_mode;
+                _labelAlliance = d.alliance || "both";
+                const panel = document.getElementById('label-panel');
+                if (panel) panel.style.display = _labelMode ? 'block' : 'none';
+                if (!_labelMode) return;
+                document.getElementById('label-video').textContent = d.video || '—';
+                document.getElementById('label-path').textContent =
+                    d.path ? d.path.split('/').slice(-2).join('/') : 'labels/…';
+                document.getElementById('label-r-cls').textContent =
+                    d.counts?.red?.classified ?? 0;
+                document.getElementById('label-r-ovr').textContent =
+                    d.counts?.red?.overflow ?? 0;
+                document.getElementById('label-b-cls').textContent =
+                    d.counts?.blue?.classified ?? 0;
+                document.getElementById('label-b-ovr').textContent =
+                    d.counts?.blue?.overflow ?? 0;
+                document.getElementById('label-events-count').textContent =
+                    (d.events || []).length;
+                // Alliance-pill color + cell visibility + hotkey labels
+                const pill = document.getElementById('label-alliance-pill');
+                const colRed  = document.getElementById('label-col-red');
+                const colBlue = document.getElementById('label-col-blue');
+                const hint = document.getElementById('label-hotkey-hint');
+                if (_labelAlliance === 'red') {
+                    pill.textContent = 'RED ONLY';
+                    pill.style.background = '#e94560';
+                    pill.style.color = '#000';
+                    colRed.style.display = '';  colBlue.style.display = 'none';
+                    document.getElementById('label-r-cls-key').textContent = 'Q';
+                    document.getElementById('label-r-ovr-key').textContent = 'W';
+                    hint.innerHTML = 'Hotkeys (RED): <kbd>Q</kbd> classified · <kbd>W</kbd> overflow · <kbd>Z</kbd> undo · <kbd>Space</kbd> play/pause';
+                } else if (_labelAlliance === 'blue') {
+                    pill.textContent = 'BLUE ONLY';
+                    pill.style.background = '#7a8eff';
+                    pill.style.color = '#000';
+                    colRed.style.display = 'none';  colBlue.style.display = '';
+                    // When locked to blue, repurpose Q/W for it (same hand pos)
+                    document.getElementById('label-b-cls-key').textContent = 'Q';
+                    document.getElementById('label-b-ovr-key').textContent = 'W';
+                    hint.innerHTML = 'Hotkeys (BLUE): <kbd>Q</kbd> classified · <kbd>W</kbd> overflow · <kbd>Z</kbd> undo · <kbd>Space</kbd> play/pause';
+                } else {
+                    pill.textContent = 'BOTH';
+                    pill.style.background = '#2a2f4a';
+                    pill.style.color = '#fff';
+                    colRed.style.display = '';  colBlue.style.display = '';
+                    document.getElementById('label-r-cls-key').textContent = 'Q';
+                    document.getElementById('label-r-ovr-key').textContent = 'W';
+                    document.getElementById('label-b-cls-key').textContent = 'A';
+                    document.getElementById('label-b-ovr-key').textContent = 'S';
+                    hint.innerHTML = 'Hotkeys: <kbd>Q</kbd> R-cls · <kbd>W</kbd> R-ovr · <kbd>A</kbd> B-cls · <kbd>S</kbd> B-ovr · <kbd>Z</kbd> undo · <kbd>Space</kbd> play/pause';
+                }
+            }).catch(() => {});
+        }
+        // Poll less aggressively than the main loop; updates already
+        // happen synchronously after each click via incLabel().
+        setInterval(pollLabelState, 1500);
+        pollLabelState();
+
+        // ============= BENCHMARK =============
+        // Compares live auto count against the loaded ground-truth
+        // labels. Card hides itself if no labels file was loaded.
+        function _benchAccCell(c) {
+            const acc = c.f1 != null ? c.f1 : c.raw_acc;
+            if (acc == null) return '<span style="color:#666;">—</span>';
+            const pct = Math.round(acc * 100);
+            const color = pct >= 90 ? '#4ade80' : pct >= 70 ? '#ffb700' : '#ff6464';
+            return `<span style="color:${color};">${pct}%</span>`;
+        }
+        function onBenchTolChange() {
+            const v = parseInt(document.getElementById('bench-tol-input').value, 10) || 150;
+            document.getElementById('bench-tol-sec').textContent = (v / 30).toFixed(1);
+            pollBenchmark();   // immediate refresh with new tolerance
+        }
+        function pollBenchmark() {
+            if (_frozen) return;
+            const tol = parseInt(document.getElementById('bench-tol-input')?.value || '150', 10);
+            fetch('/api/benchmark?tol=' + tol).then(r => r.json()).then(d => {
+                const card = document.getElementById('benchmark-card');
+                if (!d.available) { card.style.display = 'none'; return; }
+                card.style.display = '';
+                document.getElementById('bench-clip').textContent =
+                    (d.video || '') +
+                    (d.start_frame ? ` (start_frame=${d.start_frame} / ${(d.start_frame/30).toFixed(1)}s)` : '');
+                document.getElementById('bench-tol-sec').textContent =
+                    (d.tolerance_frames / 30).toFixed(1);
+                const rows = [];
+                for (const a of ['red','blue']) {
+                    for (const l of ['classified','overflow']) {
+                        const c = d.cells[a][l];
+                        const color = a === 'red' ? '#e94560' : '#7a8eff';
+                        rows.push(
+                          `<tr>
+                            <td style="padding:4px 8px;color:${color};">${a.toUpperCase()} ${l}</td>
+                            <td style="text-align:right; padding:4px 8px;">${c.gt}</td>
+                            <td style="text-align:right; padding:4px 8px;">${c.auto}</td>
+                            <td style="text-align:right; padding:4px 8px; color:#4ade80;">${c.tp}</td>
+                            <td style="text-align:right; padding:4px 8px; color:#ffb700;">${c.fp}</td>
+                            <td style="text-align:right; padding:4px 8px; color:#ff6464;">${c.fn}</td>
+                            <td style="text-align:right; padding:4px 8px;">${_benchAccCell(c)}</td>
+                          </tr>`
+                        );
+                    }
+                }
+                document.getElementById('bench-rows').innerHTML = rows.join('');
+                const t = d.totals;
+                document.getElementById('bench-tot-gt').textContent = t.gt;
+                document.getElementById('bench-tot-auto').textContent = t.auto;
+                document.getElementById('bench-tot-tp').textContent = t.tp;
+                document.getElementById('bench-tot-fp').textContent = t.fp;
+                document.getElementById('bench-tot-fn').textContent = t.fn;
+                document.getElementById('bench-tot-acc').innerHTML = _benchAccCell({f1: null, raw_acc: t.raw_acc});
+                // Per-event detail
+                const fmt = e => `f${e.frame ?? e.gt_frame} ${e.alliance} ${e.line}`;
+                const missed = (d.missed_tail || []).map(e =>
+                    `<div style="color:#ff8080;">${fmt(e)}</div>`).join('');
+                const fp = (d.false_pos_tail || []).map(e =>
+                    `<div style="color:#ffb700;">${fmt(e)}</div>`).join('');
+                document.getElementById('bench-missed').innerHTML = missed || '<span style="color:#666;">none</span>';
+                document.getElementById('bench-fp').innerHTML = fp || '<span style="color:#666;">none</span>';
+            }).catch(() => {});
+        }
+        setInterval(pollBenchmark, 1000);
+        pollBenchmark();
+
+        // Hotkeys: Q/W/A/S = the four +1 cells, Z = undo last +1,
+        // Space = play/pause. Ignored if user is typing in an input.
+        window.addEventListener('keydown', (ev) => {
+            if (!_labelMode) return;
+            const t = ev.target;
+            if (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA') return;
+            const key = ev.key.toLowerCase();
+            // Z = undo last +1, Space = play/pause. Handle these BEFORE
+            // the cell-routing chain so the chain is a clean if/else.
+            if (key === 'z') {
+                if (_lastLabelAction) {
+                    incLabel(_lastLabelAction[0], _lastLabelAction[1], -1);
+                    _lastLabelAction = null;
+                }
+                ev.preventDefault();
+                return;
+            }
+            if (key === ' ') {
+                fetch('/api/replay/pause', {method: 'POST'});
+                ev.preventDefault();
+                return;
+            }
+            // Cell hotkeys: when locked to one alliance, Q/W route to
+            // its classified/overflow. In 'both' mode, Q/W=red, A/S=blue.
+            let cell = null;
+            if (_labelAlliance === 'red') {
+                if (key === 'q') cell = ['red', 'classified'];
+                else if (key === 'w') cell = ['red', 'overflow'];
+            } else if (_labelAlliance === 'blue') {
+                if (key === 'q') cell = ['blue', 'classified'];
+                else if (key === 'w') cell = ['blue', 'overflow'];
+            } else {
+                if (key === 'q') cell = ['red',  'classified'];
+                else if (key === 'w') cell = ['red',  'overflow'];
+                else if (key === 'a') cell = ['blue', 'classified'];
+                else if (key === 's') cell = ['blue', 'overflow'];
+            }
+            if (!cell) return;
+            ev.preventDefault();
+            incLabel(cell[0], cell[1], +1);
+        });
+
+        // One-shot fetch the server-side version probe and color the pill.
+        // If server_has_dedup is false, paint the pill RED — that's the
+        // signal that the Python process needs a restart.
+        fetch('/api/version').then(r => r.json()).then(v => {
+            const el = document.getElementById('ver-server');
+            const pill = document.getElementById('ver-pill');
+            if (!el || !pill) return;
+            el.textContent = (v['csrt_tracker.py'] || '?').slice(5, 16);
+            if (v.server_has_dedup === false) {
+                pill.style.background = '#3a1010';
+                pill.style.color = '#ff6464';
+                pill.title = 'SERVER IS STALE — Python needs restart (no dedup attr).';
+            } else if (v.server_has_dedup === true) {
+                pill.style.background = '#102a20';
+                pill.style.color = '#4ade80';
+                pill.title = 'Server has dedup enabled.';
+            }
+        }).catch(() => {});
+
         // ============= MOTIF =============
         let currentMotif = 'GPP';
         function setMotif(motif) {
@@ -991,6 +1405,7 @@
         }
 
         function updateScores() {
+            if (_frozen) return;
             fetch('/api/scores').then(r => r.json()).then(data => {
                 if (data.red && data.blue) {
                     updateAlliancePanel('red', data.red);
@@ -1115,6 +1530,7 @@
         }
 
         function pollMatchState() {
+            if (_frozen) return;
             fetch('/api/match/state').then(r => r.json()).then(d => {
                 applyPhaseUI(d.phase, d.remaining, d.elapsed, d.auto_snapshot, d.final_snapshot);
                 // Only show scrub bar during SETUP so user can seek before match starts
@@ -1244,38 +1660,254 @@
             }).join('');
         }
 
+        // The setup-view CSRT-detail panel was removed (it disappeared
+        // when the match started). The match-view TRACKER ACTIVITY card
+        // (renderCsrtEvents → csrt-events-red/blue) is the canonical
+        // CSRT debug surface and is shown both pre- and post-match.
+
+        // Cursors for the per-alliance CSRT lifecycle event stream.
+        const _csrtEventSeq = { red: 0, blue: 0 };
+        const _csrtEventBuf = { red: [], blue: [] };
+        const CSRT_EVENT_MAX = 600;
+
+        function _csrtEvLine(e) {
+            const f = 'f' + e.frame;
+            const tid = '#' + e.tid;
+            const c = e.color || '?';
+            switch (e.kind) {
+                case 'birth':
+                    return `<div class="ev new">${f} BIRTH ${tid} ${c} @${e.pos[0]},${e.pos[1]}</div>`;
+                case 'coast_start':
+                    return `<div class="ev matched">${f} coast ${tid} ${c} v=(${e.vel[0]},${e.vel[1]}) @${e.pos[0]},${e.pos[1]}</div>`;
+                case 'retire':
+                    return `<div class="ev retired">${f} RETIRE ${tid} ${c} @${e.pos[0]},${e.pos[1]} (lost ${e.lost_frames}f)</div>`;
+                case 'resurrect':
+                    const errnote = e.proj_err > 30 ? ` <span style="color:#ffb700;">⚠proj_err=${e.proj_err}</span>` : ` proj_err=${e.proj_err}`;
+                    return `<div class="ev new">${f} RESURRECT ${tid} ${c} @${e.pos[0]},${e.pos[1]} after ${e.gap_frames}f${errnote}</div>`;
+                case 'anchor_iou':
+                    const xc1 = e.cross_color ? ' <span style="color:#ff6464;">⚠cross-color</span>' : '';
+                    return `<div class="ev matched">${f} anchor[iou=${e.iou}] ${tid} ${c} @${e.pos[0]},${e.pos[1]}${xc1}</div>`;
+                case 'anchor_dist':
+                    const xc2 = e.cross_color ? ' <span style="color:#ff6464;">⚠cross-color</span>' : '';
+                    return `<div class="ev matched">${f} anchor[d=${e.dist}px] ${tid} ${c} @${e.pos[0]},${e.pos[1]}${xc2}</div>`;
+                case 'dedup':
+                    return `<div class="ev retired">${f} DEDUP ${tid} ${c} → #${e.merged_into} (${e.dist}px apart)</div>`;
+                case 'frame_summary':
+                    // Yellow when YOLO det count is less than active
+                    // tracker count for that color — likely YOLO miss.
+                    const miss_p = e.yolo_p < e.active_p;
+                    const miss_g = e.yolo_g < e.active_g;
+                    const miss_flag = (miss_p || miss_g)
+                        ? ' <span style="color:#ffb700;">⚠YOLO undercount</span>' : '';
+                    return `<div class="ev" style="color:#888;border-top:1px dashed #2a2f4a;padding-top:2px;">${f} dets P:${e.yolo_p} G:${e.yolo_g} · active P:${e.active_p} G:${e.active_g} · ghosts:${e.ghosts}${miss_flag}</div>`;
+                default:
+                    return `<div class="ev">${f} ${e.kind} ${tid}</div>`;
+            }
+        }
+
+        function renderCsrtEvents(alliance, events) {
+            if (!events || !events.length) return;
+            const buf = _csrtEventBuf[alliance];
+            for (const e of events) {
+                buf.push(e);
+                if (e.seq > _csrtEventSeq[alliance]) {
+                    _csrtEventSeq[alliance] = e.seq;
+                }
+            }
+            while (buf.length > CSRT_EVENT_MAX) buf.shift();
+            const el = document.getElementById('csrt-events-' + alliance);
+            if (!el) return;
+            // Newest first
+            const lines = buf.slice().reverse().map(_csrtEvLine);
+            el.innerHTML = lines.join('') ||
+                '<div style="color:#666;padding:4px;">No events yet</div>';
+        }
+
         function pollTripwireDebug() {
+            if (_frozen) return;
             const qs = [
                 'since_red_gate=' + _tripDebugSeqs.red.gate,
                 'since_red_overflow=' + _tripDebugSeqs.red.overflow,
                 'since_blue_gate=' + _tripDebugSeqs.blue.gate,
                 'since_blue_overflow=' + _tripDebugSeqs.blue.overflow,
+                'since_csrt_red=' + _csrtEventSeq.red,
+                'since_csrt_blue=' + _csrtEventSeq.blue,
             ].join('&');
             fetch('/api/tripwire_debug?' + qs)
               .then(r => r.json())
               .then(data => {
                   for (const alliance of ['red','blue']) {
                       const a = data[alliance];
-                      if (!a) continue;
-                      for (const zone of ['gate','overflow']) {
-                          const z = a[zone];
-                          if (!z) continue;
-                          const buf = _tripDebugBuf[alliance][zone];
-                          for (const e of (z.events || [])) {
-                              buf.push(e);
-                              if (e.seq > _tripDebugSeqs[alliance][zone]) {
-                                  _tripDebugSeqs[alliance][zone] = e.seq;
+                      if (a) {
+                          for (const zone of ['gate','overflow']) {
+                              const z = a[zone];
+                              if (!z) continue;
+                              const buf = _tripDebugBuf[alliance][zone];
+                              for (const e of (z.events || [])) {
+                                  buf.push(e);
+                                  if (e.seq > _tripDebugSeqs[alliance][zone]) {
+                                      _tripDebugSeqs[alliance][zone] = e.seq;
+                                  }
                               }
+                              while (buf.length > TRIP_DEBUG_MAX * 2) buf.shift();
+                              renderTripEvents(alliance, zone, z.count, (z.active || []).length);
                           }
-                          while (buf.length > TRIP_DEBUG_MAX * 2) buf.shift();
-                          renderTripEvents(alliance, zone, z.count, (z.active || []).length);
                       }
+                      renderCsrtEvents(alliance, data['csrt_' + alliance + '_events']);
                   }
               })
               .catch(() => {});
         }
         setInterval(pollTripwireDebug, 250);
         pollTripwireDebug();
+
+
+        // ============= FREEZE-FOR-DEBUG =============
+        // _frozen is declared at the top of this <script> so the early
+        // setInterval calls can gate on it. Toggling it with this
+        // button stops every poll, so the dashboard's displayed state
+        // stays exactly as it was at the moment something broke.
+        function freezeForDebug() {
+            _frozen = !_frozen;
+            const btn = document.getElementById('freeze-btn');
+            if (btn) {
+                btn.textContent = _frozen ? '❄ FROZEN' : '⏸ FREEZE';
+                btn.style.background = _frozen ? '#c93333' : '#3a1010';
+                btn.style.color      = _frozen ? '#fff'    : '#ff8080';
+            }
+            // YOLO-app endpoint accepts an explicit paused state — no
+            // toggle race like the HSV-pivot endpoint.
+            fetch('/api/replay/pause', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({paused: _frozen}),
+            }).catch(() => {});
+        }
+
+        async function copyDebugSnapshot() {
+            // Pull every state-bearing endpoint in parallel.
+            const [trip, scores, match, exit, score_ev, replay] = await Promise.all([
+                fetch('/api/tripwire_debug?since_red_gate=0&since_red_overflow=0&since_blue_gate=0&since_blue_overflow=0').then(r => r.json()).catch(() => ({})),
+                fetch('/api/scores').then(r => r.json()).catch(() => ({})),
+                fetch('/api/match/state').then(r => r.json()).catch(() => ({})),
+                fetch('/api/exit_events?since=0').then(r => r.json()).catch(() => []),
+                fetch('/api/score_events?since=0').then(r => r.json()).catch(() => []),
+                fetch('/api/replay/status').then(r => r.json()).catch(() => ({})),
+            ]);
+
+            // Build a HUMAN-readable header so the answer to "what
+            // happened?" is at the top of the snapshot, not buried in
+            // raw JSON. The full JSON follows for completeness.
+            const lines = [];
+            lines.push('=== FTC DEBUG SNAPSHOT ===');
+            lines.push('ts: ' + new Date().toISOString());
+            lines.push('frame: ' + (replay?.current_frame ?? '?') +
+                       ' / ' + (replay?.total_frames ?? '?') +
+                       ' (paused: ' + replay?.paused + ')');
+            lines.push('phase: ' + (match?.phase ?? '?') +
+                       ' remaining: ' + (match?.remaining ?? '?'));
+            if (scores?.red) {
+                lines.push('RED  scores:  classified=' + scores.red.classified_count +
+                           ' overflow=' + scores.red.overflow_count +
+                           ' total=' + scores.red.total);
+            }
+            if (scores?.blue) {
+                lines.push('BLUE scores:  classified=' + scores.blue.classified_count +
+                           ' overflow=' + scores.blue.overflow_count +
+                           ' total=' + scores.blue.total);
+            }
+            // CSRT activity from the in-memory buffer we already render.
+            // Most-recent first, both alliances.
+            lines.push('');
+            lines.push('--- RED CSRT activity (newest first, last ' +
+                       _csrtEventBuf.red.length + ') ---');
+            for (const e of _csrtEventBuf.red.slice().reverse()) {
+                lines.push(`  f${e.frame} ${e.kind} #${e.tid} ${e.color||'?'}` +
+                           (e.pos ? ` @${e.pos[0]},${e.pos[1]}` : '') +
+                           (e.iou != null ? ` iou=${e.iou}` : '') +
+                           (e.dist != null ? ` dist=${e.dist}px` : '') +
+                           (e.merged_into != null ? ` →#${e.merged_into}` : '') +
+                           (e.proj_err != null ? ` proj_err=${e.proj_err}` : '') +
+                           (e.lost_frames != null ? ` lost=${e.lost_frames}f` : '') +
+                           (e.gap_frames != null ? ` gap=${e.gap_frames}f` : '') +
+                           (e.cross_color ? ' ⚠cross-color' : ''));
+            }
+            lines.push('');
+            lines.push('--- BLUE CSRT activity (newest first, last ' +
+                       _csrtEventBuf.blue.length + ') ---');
+            for (const e of _csrtEventBuf.blue.slice().reverse()) {
+                lines.push(`  f${e.frame} ${e.kind} #${e.tid} ${e.color||'?'}` +
+                           (e.pos ? ` @${e.pos[0]},${e.pos[1]}` : '') +
+                           (e.merged_into != null ? ` →#${e.merged_into}` : ''));
+            }
+            // Recent score events (the +3 / +1 you actually see in the log)
+            lines.push('');
+            lines.push('--- last 20 score events ---');
+            for (const e of (score_ev || []).slice(-20)) {
+                lines.push('  ' + JSON.stringify(e));
+            }
+            // Tripwire counts so we can read the auto count side-by-side
+            lines.push('');
+            lines.push('--- tripwire totals ---');
+            for (const a of ['red', 'blue']) {
+                const tt = trip?.[a];
+                if (!tt) continue;
+                lines.push(`  ${a}: gate=${tt.gate?.count} overflow=${tt.overflow?.count}`);
+            }
+            // Then dump the raw JSON for full fidelity.
+            const dump = {
+                ts: new Date().toISOString(),
+                replay, match, scores, tripwire: trip,
+                exit_events_tail: (exit || []).slice(-30),
+                score_events_tail: (score_ev || []).slice(-30),
+                csrt_event_buf_red:  _csrtEventBuf.red,
+                csrt_event_buf_blue: _csrtEventBuf.blue,
+            };
+            lines.push('');
+            lines.push('--- raw JSON ---');
+            lines.push(JSON.stringify(dump, null, 2));
+            const text = lines.join('\n');
+            const ta = document.getElementById('debug-snapshot-out');
+            ta.style.display = 'block';
+            ta.value = text;
+            // Always scroll the textarea into view + flash a status.
+            ta.scrollIntoView({behavior: 'smooth', block: 'start'});
+            ta.focus();
+            ta.select();
+            // Save to disk so we have a permanent record regardless
+            // of clipboard outcome.
+            let saved_filename = null;
+            try {
+                const r = await fetch('/api/save_snapshot', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({text}),
+                });
+                const j = await r.json();
+                if (j.ok) saved_filename = j.filename;
+            } catch (_e) {}
+            // Best-effort clipboard.
+            let clip_ok = false;
+            try {
+                await navigator.clipboard.writeText(text);
+                clip_ok = true;
+            } catch (_e) {}
+            // Status flash on the button + persistent filename note.
+            const btns = document.querySelectorAll('button[onclick="copyDebugSnapshot()"]');
+            const status = saved_filename
+                ? (clip_ok ? `✓ Saved & copied: ${saved_filename}` : `✓ Saved to ${saved_filename}`)
+                : (clip_ok ? '✓ Copied (disk save FAILED)' : '⚠ See textarea below');
+            btns.forEach(b => {
+                const orig = b.textContent;
+                b.textContent = status;
+                setTimeout(() => { b.textContent = orig; }, 4000);
+            });
+            // Also prepend a "saved to" note to the textarea so the
+            // info is preserved if you don't notice the button flash.
+            if (saved_filename) {
+                ta.value = `(saved to snapshots/${saved_filename})\n\n` + ta.value;
+            }
+        }
 
 
         // ============= SCORING LOG (combined score + exit events) =============
@@ -1331,6 +1963,7 @@
         }
 
         function pollLogEvents() {
+            if (_frozen) return;
             fetch('/api/exit_events?since=' + _lastSeenExitFrame)
                 .then(r => r.json())
                 .then(d => {
@@ -1819,6 +2452,7 @@
         }
 
         function pollReplayStatus() {
+            if (_frozen) return;
             fetch('/api/replay/status').then(r => r.json()).then(d => {
                 lastReplayStatus = d;
                 const bar = document.getElementById('scrub-bar');

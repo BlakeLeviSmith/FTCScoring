@@ -104,14 +104,19 @@ YOLO_MODEL_PATH = "training/runs/detect/ftc_motion_v2/weights/best.pt"
 # what saves a track during a low-confidence frame instead of letting
 # it die. Higher values here defeat the whole point of ByteTrack's
 # two-pass matching.
-YOLO_CONFIDENCE = 0.05
+YOLO_CONFIDENCE = 0.35
 # NMS IoU threshold — pairs of detections whose IoU exceeds this get the
 # lower-confidence one suppressed. Higher = less aggressive suppression
 # = touching balls (which overlap a lot) BOTH survive instead of one
 # being killed. 0.45 is a generic default; for densely-packed objects
 # like our balls 0.7 leaves real ball-pairs alone while still killing
 # spurious duplicate boxes on a single ball.
-YOLO_IOU_THRESHOLD = 0.85
+# Bumped 0.50 → 0.75 to fix the cluster-undercount: when a lost ball
+# re-appears at the gate touching a neighbor, NMS at 0.50 suppressed
+# the second box, so the cluster matched only ONE existing tracker
+# (+1 instead of +2). At 0.75 NMS only kills near-duplicate boxes on
+# the same ball; touching pairs both survive and get their own tids.
+YOLO_IOU_THRESHOLD = 0.75
 
 # Cap on the YOLO inference imgsz. We feed the ROI crop natively (no
 # forced square resize) and ultralytics picks imgsz = next multiple of
@@ -149,6 +154,75 @@ YOLO_TTA = False
 #   "botsort_ftc.yaml"             — BoT-SORT with our tunes.
 #   "bytetrack.yaml" / "botsort.yaml" — ultralytics stock defaults.
 YOLO_TRACKER_CONFIG = "bytetrack_ftc.yaml"
+
+# Master switch for the tracker layer.
+#   "csrt"      — OpenCV CSRT correlation-filter trackers per ball.
+#                 YOLO is used only for detection + anchoring; each
+#                 ball follows its appearance through pixels frame-to-
+#                 frame. Best for fast, unpredictable motion (bounces,
+#                 direction reversals) because there's no Kalman
+#                 extrapolation — the tracker just chases pixels.
+#   "bytetrack" — ultralytics' model.track() with the yaml above.
+#                 Tracking-by-detection: relies on YOLO firing a clean
+#                 detection every frame, then associates via Kalman +
+#                 Hungarian. Good when detection is consistent.
+TRACKER_BACKEND = "csrt"
+
+# CSRT tracker tuning (only used when TRACKER_BACKEND="csrt").
+CSRT_MAX_LOST_FRAMES = 10          # CSRT internal-failure frames before retire
+CSRT_MATCH_IOU = 0.20              # min IoU for new YOLO detection ↔ tracker
+# Bumped 20 → 60 (~2s at 30fps) to fix the stagnant-ball overcount:
+# a ball settles in the zone, CSRT keeps tracking it, but YOLO may
+# briefly stop firing on it (NMS suppression by neighbors, mask
+# flicker). At 20 the tracker retired, then a fresh tid spawned on
+# the same physical ball later → tripwire counted it again. At 60 the
+# tracker survives those gaps and keeps its original tid, so the
+# tripwire stays at +1.
+CSRT_MAX_FRAMES_WITHOUT_YOLO = 60
+# Second-pass center-distance threshold (px) for matching an unmatched
+# YOLO detection to an existing tracker. IoU alone fails when the
+# detection drifts off-bbox; a center within this radius is treated as
+# the same ball and reabsorbed into the existing tracker rather than
+# spawning a duplicate. ~1 ball diameter at typical playback zoom.
+CSRT_MATCH_CENTER_PX = 35
+
+# Same-color trackers within this many pixels of each other are merged
+# (younger one retired silently). Fixes the duplicate-tracker overcount
+# you saw in your debug trace where 4 trackers covered 2 actual balls
+# at (90,185). Lower = more aggressive merge; raise if balls genuinely
+# touch shoulder-to-shoulder and you want each kept distinct.
+# A single ball is ~2*sqrt(area/pi) ≈ 42px wide, so 25px = ~half a ball.
+CSRT_DEDUP_RADIUS_PX = 25
+
+# Ghost-track resurrection — when CSRT retires a tracker, push its last
+# (position, color, tid) to a ghost list. If a new YOLO detection
+# arrives within CSRT_GHOST_MATCH_RADIUS_PX of a ghost (and color
+# matches if required) within CSRT_GHOST_MAX_FRAMES, we RESURRECT the
+# tracker under the ORIGINAL track_id instead of spawning a new one.
+# This is the simple-and-direct fix for "ball settles, CSRT loses it,
+# re-acquires as new tid" — the tid stays the same so the tripwire
+# counter doesn't double-count.
+# Bumped 45 → 90 (~3s) to back up the patient YOLO-confirmation guard:
+# even if a tracker DOES retire, the ghost lives long enough that the
+# eventual re-detection still resurrects under the original tid
+# instead of spawning a fresh one (which the tripwire would re-count).
+CSRT_GHOST_MAX_FRAMES = 90
+# Wider search radius — the ball drops vertically through the gate
+# zone quickly (~80-100 px in 3-5 frames at 30fps) and reappears on
+# the ramp below. The velocity projection in _find_matching_ghost
+# handles most of the displacement; this radius is the slop budget
+# around the projected point. 90 px covers ~2 ball diameters.
+CSRT_GHOST_MATCH_RADIUS_PX = 90
+CSRT_GHOST_REQUIRE_COLOR = True
+
+# Hard cap on concurrently-active CSRT trackers per alliance. Each tracker
+# runs CSRT.update() on every frame at ~20-50ms; without a ceiling, a
+# burst of false-positive detections spawns dozens of trackers and
+# processing FPS collapses (observed 18 -> 4 fps with ~45% drop rate).
+# 12 covers the realistic max of 9 RAMP balls + a few in flight, leaves
+# headroom for one over-detection per ball, and refuses to spawn beyond
+# that. Real balls will still be matched via the ghost-resurrection path.
+CSRT_MAX_ACTIVE_TRACKS = 12
 
 # Green saturation/value boost (0 = disabled — stock baseline).
 GREEN_SAT_BOOST = 0
@@ -190,7 +264,44 @@ TRIPWIRE_TRAIL_LENGTH = 30
 #   3 = wait 100ms (~6 frames at 60fps replay) — light requirement
 #   5 = wait 167ms — recommended for balls that come straight out of
 #       the goal and are immediately at the tripwire
-TRIPWIRE_MIN_TRACK_AGE_FRAMES = 5
+# Lowered from 5 → 2: CSRT + ghost-resurrection keeps the same track_id
+# across detection gaps, so there's no tentative-id flicker to wait out
+# the way ByteTrack required. 5 frames was killing fast normal passes
+# (ball in ROI for 6-8 frames total, barely matures before exiting).
+TRIPWIRE_MIN_TRACK_AGE_FRAMES = 2
+
+# Settled-Ball Registry (anti-double-count for stationary balls).
+#
+# A ball that has been counted by a tripwire and then sits motionless
+# (a "settled" ball) is recorded with its position + color. If CSRT
+# later loses it (collision, occlusion, etc.) and a NEW track_id is
+# spawned at the same spot, the registry deduplicates — the new track
+# is recognized as the same physical ball and isn't counted again.
+#
+# A track is considered SETTLED when its last
+# TRIPWIRE_SETTLE_FRAMES_REQUIRED positions have all moved less than
+# TRIPWIRE_SETTLE_MOTION_THRESHOLD_PX pixels.
+#
+# A new track_id is matched against the registry within
+# TRIPWIRE_SETTLED_MATCH_RADIUS_PX of any registered position; same
+# color required if TRIPWIRE_SETTLED_REQUIRE_COLOR=True.
+#
+# Registry entries that haven't been re-confirmed in
+# TRIPWIRE_SETTLED_EVICTION_FRAMES are dropped (handles balls that
+# physically leave the zone).
+TRIPWIRE_SETTLE_MOTION_THRESHOLD_PX = 8
+TRIPWIRE_SETTLE_FRAMES_REQUIRED = 5
+TRIPWIRE_SETTLED_MATCH_RADIUS_PX = 30
+# TRANSIT entries (ball moving through, never settled) evict fast so
+# they don't block subsequent balls passing through the same area.
+# At 30fps, 10 frames ≈ 0.33s — generous enough to bridge a 1-2 frame
+# YOLO blink, short enough that the next ball through doesn't dedupe.
+TRIPWIRE_TRANSIT_EVICTION_FRAMES = 10
+# SETTLED entries (ball stopped in zone) get the long window — long
+# enough to bridge multi-second CSRT losses during collisions /
+# occlusion / appearance changes.
+TRIPWIRE_SETTLED_EVICTION_FRAMES = 150
+TRIPWIRE_SETTLED_REQUIRE_COLOR = True
 
 # ============= TEMPORAL SMOOTHING =============
 STABLE_HISTORY_SIZE = 10

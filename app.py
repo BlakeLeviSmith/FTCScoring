@@ -123,6 +123,8 @@ scorer_red = ScoreKeeper()
 scorer_blue = ScoreKeeper()
 ramp_tracker_red = None
 ramp_tracker_blue = None
+csrt_tracker_red = None  # MultiBallTracker, populated when TRACKER_BACKEND="csrt"
+csrt_tracker_blue = None
 
 # ============= Match State =============
 match_state = {
@@ -143,7 +145,13 @@ match_state_lock = threading.Lock()
 
 # ============= ROI Persistence =============
 ROI_CONFIG_PATH = os.path.join(os.path.dirname(__file__), "roi_config.json")
+ROI_CONFIGS_DIR = os.path.join(os.path.dirname(__file__), "roi_configs")
 _roi_cache = None  # In-memory cache — avoids disk reads on every frame
+# Per-clip ROI override: when --replay is used, this is the path to
+# roi_configs/<clipname>.json. Reads/writes go through this file
+# instead of the global one, so each clip's camera angle gets its own
+# zones. Falls back to global roi_config.json when this is None.
+_roi_per_clip_path = None
 
 
 def _default_roi_config():
@@ -154,39 +162,54 @@ def _default_roi_config():
     }
 
 
+def _active_roi_path():
+    """Per-clip path if set, else the global file."""
+    return _roi_per_clip_path or ROI_CONFIG_PATH
+
+
 def load_roi_config():
     """Load ROI config from memory cache, falling back to disk on first call.
 
-    Handles migration from the old single-ROI format to dual-alliance format.
+    When _roi_per_clip_path is set, that file is the canonical store.
+    If it doesn't exist yet, we seed it from the global roi_config.json
+    so the user gets reasonable defaults the first time they open a
+    new clip — they can then adjust + save and the per-clip file gets
+    written without affecting the global one.
     """
     global _roi_cache
     if _roi_cache is not None:
         return _roi_cache
-    if os.path.exists(ROI_CONFIG_PATH):
+    path = _active_roi_path()
+    sources = [path] if path == ROI_CONFIG_PATH else [path, ROI_CONFIG_PATH]
+    for src in sources:
+        if not os.path.exists(src):
+            continue
         try:
-            with open(ROI_CONFIG_PATH, "r") as f:
+            with open(src, "r") as f:
                 data = json.load(f)
-                # Migrate old single-ROI format -> dual-alliance
-                if "red" not in data and "blue" not in data:
-                    migrated = _default_roi_config()
-                    if data.get("roi") or data.get("gate"):
-                        migrated["red"]["roi"] = data.get("roi")
-                        migrated["red"]["gate"] = data.get("gate")
-                    _roi_cache = migrated
-                    return _roi_cache
+            if "red" not in data and "blue" not in data:
+                # Old single-ROI format → migrate
+                migrated = _default_roi_config()
+                if data.get("roi") or data.get("gate"):
+                    migrated["red"]["roi"] = data.get("roi")
+                    migrated["red"]["gate"] = data.get("gate")
+                _roi_cache = migrated
+            else:
                 _roi_cache = data
-                return _roi_cache
+            return _roi_cache
         except (json.JSONDecodeError, IOError):
-            pass
+            continue
     _roi_cache = _default_roi_config()
     return _roi_cache
 
 
 def save_roi_config(data):
-    """Save ROI and gate zone to disk and update cache."""
+    """Save ROI to the active path (per-clip or global) + cache."""
     global _roi_cache
     _roi_cache = data
-    with open(ROI_CONFIG_PATH, "w") as f:
+    path = _active_roi_path()
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w") as f:
         json.dump(data, f, indent=2)
 
 
@@ -699,6 +722,25 @@ def grab_loop_replay(video_path, target_fps=15, loop=True):
         cap.release()
         if not loop:
             print("[*] Replay finished (single pass)")
+            if _auto_run:
+                # No browser → benchmark endpoint never gets polled
+                # naturally. Self-poll once via Flask test client so
+                # the auto-save side-effect fires + writes the results
+                # file, then exit so the batch runner moves on.
+                print("[*] --auto-run: triggering final benchmark write...")
+                try:
+                    with app.test_client() as client:
+                        r = client.get("/api/benchmark?tol=150")
+                        d = r.get_json()
+                        if d and d.get("available"):
+                            t = d["totals"]
+                            print(f"[*] FINAL  GT={t['gt']} Auto={t['auto']} "
+                                  f"TP={t['tp']} FP={t['fp']} FN={t['fn']} "
+                                  f"raw={(t['raw_acc'] or 0)*100:.0f}%")
+                except Exception as e:
+                    print(f"[*] benchmark write failed: {e}")
+                time.sleep(0.5)
+                os._exit(0)
             while True:
                 if _replay_switch_to is not None:
                     break
@@ -923,7 +965,7 @@ def _line_side(px, py, p1, p2):
 
 
 def _process_alliance_roi_crop(frame, roi_poly, tracker, scorer_obj, detector_ref, stream_id="default",
-                                alliance_roi_data=None):
+                                alliance_roi_data=None, csrt_tracker=None):
     """Crop ROI bounding box, mask non-ROI pixels black, run YOLO once,
     push detections through the alliance's tripwire counter.
 
@@ -972,6 +1014,15 @@ def _process_alliance_roi_crop(frame, roi_poly, tracker, scorer_obj, detector_re
     except TypeError:
         balls, stable_pattern, raw_pattern, _ = detector_ref.detect(masked_frame)
 
+    # ---- CSRT correlation-filter tracking (when enabled) ----
+    # The detector returns balls WITHOUT track_id when running in
+    # CSRT mode (tracking_enabled=False). Each alliance's
+    # MultiBallTracker holds N independent CSRT trackers — it updates
+    # them on the masked frame, anchors them to fresh YOLO detections
+    # via IoU matching, and returns balls WITH stable track_ids.
+    if csrt_tracker is not None:
+        balls = csrt_tracker.step(masked_frame, balls)
+
     # Map detection coordinates from processed-crop space back to the full
     # original frame so tripwires (in normalized full-frame coords) hit-test
     # correctly. Filter to balls actually inside the user-drawn ROI poly.
@@ -991,7 +1042,12 @@ def _process_alliance_roi_crop(frame, roi_poly, tracker, scorer_obj, detector_re
 
     # ---- Tripwire counter update ----
     if tracker is not None:
-        tracker.update(mapped, (h, w))
+        # Pass the source-clip frame so event-log timestamps align with
+        # the ground-truth labels (which use _replay_current_frame).
+        # In live camera mode _replay_current_frame is 0; tripwire
+        # falls back to its internal counter.
+        src_frame = _replay_current_frame if _replay_current_frame else None
+        tracker.update(mapped, (h, w), source_frame=src_frame)
 
         prev = scorer_obj.get_scores()
         totals = tracker.get_totals()
@@ -1014,7 +1070,7 @@ def _process_alliance_roi_crop(frame, roi_poly, tracker, scorer_obj, detector_re
     # Draw tripwire polygons in crop-space so the user sees where they sit
     a_data = alliance_roi_data or {}
     for trip_key, trip_color in (("gate_trip",      (255, 200,   0)),
-                                 ("overflow_trip", (  0, 200, 255))):
+                                 ("overflow_trip",  (  0, 200, 255))):
         poly = a_data.get(trip_key)
         if poly and len(poly) >= 3:
             pts = []
@@ -1031,27 +1087,39 @@ def _process_alliance_roi_crop(frame, roi_poly, tracker, scorer_obj, detector_re
     # debug aid for "is the tracker dropping mid-crossing?" — a long
     # continuous trail = good. Multiple short trails of different colors
     # for what should be one ball = the tracker swapped/lost the id.
-    if tracker is not None and hasattr(tracker, "get_trails"):
-        try:
-            from tripwire_counter import stable_color_for_tid as _trail_color
-        except ImportError:
-            _trail_color = None
-        if _trail_color is not None:
-            trails = tracker.get_trails()
-            for tid, points in trails.items():
-                if len(points) < 2:
-                    continue
-                color = _trail_color(int(tid))
-                pts_view = []
-                for (x, y, _frame, _c) in points:
+    # Prefer CSRT trails (more accurate, proc-coord space) when available;
+    # fall back to TripwireCounter's full-frame-coord trails otherwise.
+    try:
+        from tripwire_counter import stable_color_for_tid as _trail_color
+    except ImportError:
+        _trail_color = None
+    trails_to_draw = None
+    trail_coords_in_proc_space = False
+    if csrt_tracker is not None and hasattr(csrt_tracker, "get_trails"):
+        trails_to_draw = csrt_tracker.get_trails()
+        trail_coords_in_proc_space = True  # CSRT trails are in masked_frame coords
+    elif tracker is not None and hasattr(tracker, "get_trails"):
+        trails_to_draw = tracker.get_trails()
+        trail_coords_in_proc_space = False  # TripwireCounter uses full-frame coords
+    if trails_to_draw is not None and _trail_color is not None:
+        for tid, points in trails_to_draw.items():
+            if len(points) < 2:
+                continue
+            color = _trail_color(int(tid))
+            pts_view = []
+            for (x, y, _frame, _c) in points:
+                if trail_coords_in_proc_space:
+                    cx = int(x * sx_disp)
+                    cy = int(y * sy_disp)
+                else:
                     cx = int((x - bx) * sx * sx_disp)
                     cy = int((y - by) * sy * sy_disp)
-                    pts_view.append([cx, cy])
-                cv2.polylines(view, [np.array(pts_view, dtype=np.int32)],
-                              False, color, 2, cv2.LINE_AA)
-                hx, hy = pts_view[-1]
-                cv2.putText(view, f"#{int(tid)}", (hx + 4, hy - 4),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 1, cv2.LINE_AA)
+                pts_view.append([cx, cy])
+            cv2.polylines(view, [np.array(pts_view, dtype=np.int32)],
+                          False, color, 2, cv2.LINE_AA)
+            hx, hy = pts_view[-1]
+            cv2.putText(view, f"#{int(tid)}", (hx + 4, hy - 4),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 1, cv2.LINE_AA)
 
     # Draw detection boxes (with track id if available)
     for b in mapped:
@@ -1251,6 +1319,67 @@ def _draw_alliance_overlays(processed, roi_data, alliance, color_roi, color_gate
 
 
 _debug_mode = False   # Set by --debug flag; skips YOLO entirely
+_auto_run = False     # Set by --auto-run; starts match + exits at end
+
+# ============= LABEL MODE =============
+# Set by --label flag. When True, process_loop bypasses YOLO/CSRT
+# entirely and just publishes raw frames with a "LABEL MODE" overlay.
+# The user clicks 4 +1 buttons (or hits Q/W/A/S hotkeys) to record
+# ground truth. Counts + per-click events persist to labels/<video>.json
+# so a benchmarking script can later compare auto-count vs human-count.
+_label_mode = False
+_label_alliance = "both"   # "red" | "blue" | "both" — locks the active pass
+_label_lock = threading.Lock()
+# Read-only ground-truth loaded at startup whenever a labels/<clip>.json
+# exists for the --replay file. Used by /api/benchmark to compute live
+# accuracy of the auto counter vs the human-labeled events.
+_ground_truth = None
+_label_counts = {
+    "red":  {"classified": 0, "overflow": 0},
+    "blue": {"classified": 0, "overflow": 0},
+}
+_label_events = []      # [{seq, frame, t, alliance, line}]
+_label_seq = 0
+_label_video_basename = None   # set at startup, used to name the JSON
+
+def _label_path():
+    here = os.path.dirname(os.path.abspath(__file__))
+    d = os.path.join(here, "labels")
+    os.makedirs(d, exist_ok=True)
+    name = (_label_video_basename or "unknown") + ".json"
+    return os.path.join(d, name)
+
+def _label_save():
+    """Atomic write so concurrent reads never see a half-written file."""
+    path = _label_path()
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump({
+            "video": _label_video_basename,
+            "counts": _label_counts,
+            "events": _label_events,
+        }, f, indent=2)
+    os.replace(tmp, path)
+
+def _label_load():
+    """Load any pre-existing ground truth for THIS video so a labeling
+    session can be resumed across restarts."""
+    global _label_seq
+    path = _label_path()
+    if not os.path.exists(path):
+        return
+    try:
+        with open(path) as f:
+            d = json.load(f)
+        for a in ("red", "blue"):
+            for ln in ("classified", "overflow"):
+                _label_counts[a][ln] = int(
+                    ((d.get("counts") or {}).get(a) or {}).get(ln, 0))
+        _label_events.clear()
+        _label_events.extend(d.get("events") or [])
+        _label_seq = max((e.get("seq", 0) for e in _label_events), default=0)
+    except (json.JSONDecodeError, KeyError, TypeError, ValueError):
+        pass
 
 
 def process_loop():
@@ -1261,6 +1390,7 @@ def process_loop():
     last_seq = -1
     last_time = time.time()
     proc_count = 0
+    last_idle_print = time.time()
 
     # Alliance overlay colors (BGR)
     RED_COLOR = (0, 0, 255)
@@ -1274,6 +1404,16 @@ def process_loop():
             seq = frame_seq
 
         if frame is None or seq == last_seq:
+            # Heartbeat so the user sees "model alive but no frames"
+            # in the terminal. Distinguishes "process_loop is dead"
+            # from "no frames are arriving" (replay paused, USB cam
+            # detached, ESP32 disconnected, etc).
+            now = time.time()
+            if now - last_idle_print >= 2.0:
+                last_idle_print = now
+                reason = "no frame yet" if frame is None else "no new frame (paused?)"
+                print(f"[proc/idle] {reason} | seq={seq} last_seq={last_seq}",
+                      flush=True)
             time.sleep(0.005)
             continue
 
@@ -1288,6 +1428,36 @@ def process_loop():
         last_seq = seq
         roi_data = load_roi_config()
         h, w = frame.shape[:2]
+
+        # ---- LABEL MODE: bypass YOLO/CSRT entirely ----
+        # The frame is published as-is with a small overlay; user
+        # records ground truth via the +1 buttons / hotkeys. This
+        # path is the canonical way to collect benchmark labels.
+        if _label_mode:
+            processed = frame.copy()
+            cv2.rectangle(processed, (8, 8), (220, 44), (0, 0, 0), -1)
+            cv2.putText(processed, "LABEL MODE", (14, 36),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 220, 255), 2)
+            with _label_lock:
+                line1 = (f"R cls={_label_counts['red']['classified']} "
+                         f"ovr={_label_counts['red']['overflow']}")
+                line2 = (f"B cls={_label_counts['blue']['classified']} "
+                         f"ovr={_label_counts['blue']['overflow']}")
+            cv2.putText(processed, line1, (14, 78),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (60, 60, 255), 2)
+            cv2.putText(processed, line2, (14, 108),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 140, 60), 2)
+            _, jpg_buf = cv2.imencode(".jpg", processed, JPEG_ENCODE_PARAMS)
+            with frame_lock:
+                latest_processed_jpg = jpg_buf.tobytes()
+            proc_count += 1
+            now = time.time()
+            if now - last_time >= 1.0:
+                with camera_stats_lock:
+                    camera_stats["process_fps"] = proc_count / (now - last_time)
+                proc_count = 0
+                last_time = now
+            continue
 
         # ---- DEBUG MODE: zone overlays only, no YOLO ----
         if _debug_mode:
@@ -1368,9 +1538,9 @@ def process_loop():
             processed = frame.copy()
             annotated_crops = {"red": None, "blue": None}
 
-            for alliance, tracker, scorer_obj in [
-                ("red", ramp_tracker_red, scorer_red),
-                ("blue", ramp_tracker_blue, scorer_blue),
+            for alliance, tracker, scorer_obj, csrt in [
+                ("red", ramp_tracker_red, scorer_red, csrt_tracker_red),
+                ("blue", ramp_tracker_blue, scorer_blue, csrt_tracker_blue),
             ]:
                 a_roi = (roi_data.get(alliance) or {}).get("roi")
                 if a_roi is None:
@@ -1381,6 +1551,7 @@ def process_loop():
                     frame, a_roi, tracker, scorer_obj, detector,
                     stream_id=alliance,
                     alliance_roi_data=roi_data.get(alliance) or {},
+                    csrt_tracker=csrt,
                 )
                 annotated_crops[alliance] = annot_crop
                 all_balls.extend(mapped_balls)
@@ -1422,7 +1593,8 @@ def process_loop():
                     alliance_balls = []
 
                 if tracker is not None:
-                    tracker.update(alliance_balls, (h, w))
+                    src_frame = _replay_current_frame if _replay_current_frame else None
+                    tracker.update(alliance_balls, (h, w), source_frame=src_frame)
                 if a_roi is not None and len(a_roi) >= 3:
                     ramp_colors = _sort_balls_along_ramp(alliance_balls, a_roi, tracker, w, h)
                 else:
@@ -1466,6 +1638,24 @@ def process_loop():
             fps_counter["process"] = pfps
             with camera_stats_lock:
                 camera_stats["process_fps"] = pfps
+            # Once-per-second visibility into what the CSRT layer is doing.
+            # If you see "csrt_red: 0 active" while a match is playing
+            # then either the alliance has no ROI drawn or YOLO isn't
+            # firing inside it. If active>0 but the dashboard panel
+            # still shows 0, the UI poll is broken (open dev tools
+            # network tab and check /api/tripwire_debug).
+            try:
+                r_active = len(csrt_tracker_red._tracks) if csrt_tracker_red else 0
+                r_ghost = len(csrt_tracker_red._ghosts) if csrt_tracker_red else 0
+                b_active = len(csrt_tracker_blue._tracks) if csrt_tracker_blue else 0
+                b_ghost = len(csrt_tracker_blue._ghosts) if csrt_tracker_blue else 0
+                n_balls = len(latest_balls or [])
+                print(f"[proc] {pfps:5.1f} fps | balls={n_balls:3d} | "
+                      f"csrt_red: {r_active} active / {r_ghost} ghosts | "
+                      f"csrt_blue: {b_active} active / {b_ghost} ghosts",
+                      flush=True)
+            except Exception as _e:
+                pass
             proc_count = 0
             last_time = time.time()
 
@@ -1623,6 +1813,10 @@ def api_match_start():
         ramp_tracker_red.reset()
     if ramp_tracker_blue is not None:
         ramp_tracker_blue.reset()
+    if csrt_tracker_red is not None:
+        csrt_tracker_red.reset()
+    if csrt_tracker_blue is not None:
+        csrt_tracker_blue.reset()
     if hasattr(detector, 'reset_tracker'):
         detector.reset_tracker()
     scorer_red.unlock_pattern()
@@ -1648,6 +1842,10 @@ def api_match_reset():
         ramp_tracker_red.reset()
     if ramp_tracker_blue is not None:
         ramp_tracker_blue.reset()
+    if csrt_tracker_red is not None:
+        csrt_tracker_red.reset()
+    if csrt_tracker_blue is not None:
+        csrt_tracker_blue.reset()
     if hasattr(detector, 'reset_tracker'):
         detector.reset_tracker()
     scorer_red.unlock_pattern()
@@ -2143,9 +2341,24 @@ def api_tripwire_debug():
             "overflow": int(request.args.get(f"since_{prefix}_overflow", 0)),
         }
         return tr.get_debug_state(since)
+    def _csrt_state(t):
+        if t is None or not hasattr(t, "get_debug_state"):
+            return None
+        return t.get_debug_state()
+    def _csrt_events(t, since):
+        if t is None or not hasattr(t, "get_events_since"):
+            return []
+        return t.get_events_since(since)
+    since_csrt_red = int(request.args.get("since_csrt_red", 0))
+    since_csrt_blue = int(request.args.get("since_csrt_blue", 0))
     return jsonify({
         "red":  _state_for(ramp_tracker_red, "red"),
         "blue": _state_for(ramp_tracker_blue, "blue"),
+        "csrt_red":  _csrt_state(csrt_tracker_red),
+        "csrt_blue": _csrt_state(csrt_tracker_blue),
+        "csrt_red_events":  _csrt_events(csrt_tracker_red,  since_csrt_red),
+        "csrt_blue_events": _csrt_events(csrt_tracker_blue, since_csrt_blue),
+        "csrt_cap": int(getattr(config, "CSRT_MAX_ACTIVE_TRACKS", 12)),
     })
 
 
@@ -2298,6 +2511,10 @@ def api_reset_ramp():
         ramp_tracker_red.reset()
     if ramp_tracker_blue is not None:
         ramp_tracker_blue.reset()
+    if csrt_tracker_red is not None:
+        csrt_tracker_red.reset()
+    if csrt_tracker_blue is not None:
+        csrt_tracker_blue.reset()
     if hasattr(detector, 'reset_tracker'):
         detector.reset_tracker()
     scorer_red.unlock_pattern()
@@ -2343,6 +2560,10 @@ def api_play_match():
         ramp_tracker_red.reset()
     if ramp_tracker_blue is not None:
         ramp_tracker_blue.reset()
+    if csrt_tracker_red is not None:
+        csrt_tracker_red.reset()
+    if csrt_tracker_blue is not None:
+        csrt_tracker_blue.reset()
     if hasattr(detector, 'reset_tracker'):
         detector.reset_tracker()
     scorer_red.unlock_pattern()
@@ -2352,6 +2573,291 @@ def api_play_match():
 
     _replay_switch_to = path
     return jsonify({"status": "ok", "playing": name})
+
+
+@app.route("/api/label/state", methods=["GET"])
+def api_label_state():
+    """Current label-mode state — counts per cell + recent events."""
+    with _label_lock:
+        return jsonify({
+            "label_mode": _label_mode,
+            "alliance": _label_alliance,
+            "video": _label_video_basename,
+            "counts": _label_counts,
+            "events": list(_label_events),
+            "path": _label_path() if _label_mode else None,
+        })
+
+
+@app.route("/api/label/increment", methods=["POST"])
+def api_label_increment():
+    """Increment (or decrement) a manual count cell. Records frame +
+    timestamp on every +1 click; on −1, pops the most-recent matching
+    event so undo removes the right entry from the timeline."""
+    global _label_seq
+    if not _label_mode:
+        return jsonify({"ok": False, "reason": "not in label mode"}), 400
+    data = request.get_json() or {}
+    alliance = data.get("alliance")
+    line = data.get("line")
+    delta = int(data.get("delta", 1))
+    if alliance not in ("red", "blue") or line not in ("classified", "overflow"):
+        return jsonify({"ok": False, "reason": "bad alliance/line"}), 400
+    # Reject writes to the alliance not active in THIS labeling pass.
+    if _label_alliance != "both" and alliance != _label_alliance:
+        return jsonify({
+            "ok": False,
+            "reason": f"this pass is locked to {_label_alliance}; "
+                      f"restart with --alliance {alliance} to label that side",
+        }), 403
+    with _label_lock:
+        new_total = max(0, _label_counts[alliance][line] + delta)
+        _label_counts[alliance][line] = new_total
+        if delta > 0:
+            _label_seq += 1
+            _label_events.append({
+                "seq": _label_seq,
+                "frame": int(_replay_current_frame),
+                "t": time.time(),
+                "alliance": alliance,
+                "line": line,
+            })
+        elif delta < 0:
+            for i in range(len(_label_events) - 1, -1, -1):
+                ev = _label_events[i]
+                if ev["alliance"] == alliance and ev["line"] == line:
+                    _label_events.pop(i)
+                    break
+        _label_save()
+        return jsonify({"ok": True, "counts": _label_counts})
+
+
+@app.route("/api/label/reset", methods=["POST"])
+def api_label_reset():
+    """Reset only the alliance currently being labeled. Pass --alliance
+    both to reset everything in one shot."""
+    global _label_seq
+    if not _label_mode:
+        return jsonify({"ok": False, "reason": "not in label mode"}), 400
+    targets = ("red", "blue") if _label_alliance == "both" else (_label_alliance,)
+    with _label_lock:
+        for a in targets:
+            for ln in ("classified", "overflow"):
+                _label_counts[a][ln] = 0
+        # Drop only events for the alliances we cleared.
+        _label_events[:] = [e for e in _label_events
+                            if e["alliance"] not in targets]
+        _label_save()
+    return jsonify({"ok": True, "reset": list(targets)})
+
+
+@app.route("/api/benchmark", methods=["GET"])
+def api_benchmark():
+    """Compare the live auto-counter against pre-recorded ground truth.
+
+    Auto events come from the alliance tripwire counters' internal
+    _events buffer (one per actual count fire). Ground-truth events
+    come from labels/<clip>.json. Matching is greedy by frame distance:
+    each GT event finds the closest unused auto event in the same
+    (alliance, line) within ±tolerance frames.
+
+    Returns per-cell counts (gt vs auto), match counts (TP/FP/FN), and
+    per-event detail for debugging which GT events were missed and
+    which auto events fired without a GT counterpart."""
+    if _ground_truth is None:
+        return jsonify({"available": False,
+                        "reason": "no labels file loaded"})
+
+    # Default 150 = ~5 sec at 30fps. Ground-truth timing varies because
+    # human reaction time + balls moving at different rates between
+    # entry and tripwire — a tight window over-reports FP/FN. Slider in
+    # the UI lets you tune live.
+    tol = int(request.args.get("tol", 150))
+
+    # If a clip start_frame is set (camera unstable at clip start),
+    # filter both auto AND ground-truth events to frames >= start_frame.
+    # Otherwise the GT events recorded in the pre-gameplay region would
+    # all show up as missed FNs and inflate the error rate.
+    clip_start = 0
+    if ramp_tracker_red is not None and hasattr(ramp_tracker_red, "start_frame"):
+        clip_start = int(ramp_tracker_red.start_frame or 0)
+
+    # Collect auto events from both alliance tripwire counters.
+    auto_events = []
+    for alliance, tracker in [("red", ramp_tracker_red),
+                              ("blue", ramp_tracker_blue)]:
+        if tracker is None:
+            continue
+        for line_attr, line_name in [("gate_trip", "classified"),
+                                     ("overflow_trip", "overflow")]:
+            tw = getattr(tracker, line_attr, None)
+            if tw is None:
+                continue
+            for ev in getattr(tw, "_events", []):
+                auto_events.append({
+                    "alliance": alliance,
+                    "line": line_name,
+                    "frame": int(ev.get("frame", 0)),
+                    "tid": ev.get("tid"),
+                    "color": ev.get("color"),
+                })
+
+    gt_events = list(_ground_truth.get("events", []))
+    # Apply start_frame filter symmetrically: drop pre-gameplay GT events
+    # AND any auto events that somehow slipped through (shouldn't happen
+    # given tripwire_counter is gated, but defense-in-depth).
+    if clip_start > 0:
+        gt_events = [e for e in gt_events
+                     if int(e.get("frame", 0)) >= clip_start]
+        auto_events = [e for e in auto_events
+                       if int(e.get("frame", 0)) >= clip_start]
+
+    # Greedy match. For each GT event, find the closest unused auto
+    # event of the same (alliance, line) within ±tol frames.
+    auto_used = [False] * len(auto_events)
+    matched = []     # (gt, auto, dframes)
+    missed = []      # GT had it but no auto fired in window
+    for gt in gt_events:
+        best = None  # (delta, auto_idx)
+        for i, au in enumerate(auto_events):
+            if auto_used[i]:
+                continue
+            if au["alliance"] != gt["alliance"]:
+                continue
+            if au["line"] != gt["line"]:
+                continue
+            df = abs(au["frame"] - gt["frame"])
+            if df > tol:
+                continue
+            if best is None or df < best[0]:
+                best = (df, i)
+        if best is None:
+            missed.append(gt)
+        else:
+            auto_used[best[1]] = True
+            matched.append({
+                "gt_frame": gt["frame"],
+                "auto_frame": auto_events[best[1]]["frame"],
+                "delta": best[0],
+                "alliance": gt["alliance"],
+                "line": gt["line"],
+            })
+    false_positives = [a for i, a in enumerate(auto_events) if not auto_used[i]]
+
+    # Per-cell rollup
+    def _cell(alliance, line):
+        gt_n = sum(1 for e in gt_events
+                   if e["alliance"] == alliance and e["line"] == line)
+        au_n = sum(1 for e in auto_events
+                   if e["alliance"] == alliance and e["line"] == line)
+        tp = sum(1 for m in matched
+                 if m["alliance"] == alliance and m["line"] == line)
+        fn = gt_n - tp
+        fp = au_n - tp
+        # Symmetric raw-count accuracy (min/max).
+        raw_acc = (min(gt_n, au_n) / max(gt_n, au_n)) if max(gt_n, au_n) else None
+        # F1 over event-aligned matches.
+        if (tp + fp) and (tp + fn):
+            prec = tp / (tp + fp); rec = tp / (tp + fn)
+            f1 = (2 * prec * rec / (prec + rec)) if (prec + rec) else 0
+        elif gt_n == 0 and au_n == 0:
+            f1 = None
+        else:
+            f1 = 0.0
+        return {"gt": gt_n, "auto": au_n, "tp": tp, "fp": fp, "fn": fn,
+                "raw_acc": raw_acc, "f1": f1}
+
+    cells = {a: {l: _cell(a, l) for l in ("classified", "overflow")}
+             for a in ("red", "blue")}
+
+    # Overall raw + F1
+    total_gt = len(gt_events); total_auto = len(auto_events)
+    total_tp = len(matched)
+    overall_raw = (min(total_gt, total_auto) / max(total_gt, total_auto)) \
+                  if max(total_gt, total_auto) else None
+    payload = {
+        "available": True,
+        "video": _ground_truth.get("video"),
+        "tolerance_frames": tol,
+        "start_frame": clip_start,
+        "totals": {
+            "gt": total_gt, "auto": total_auto,
+            "tp": total_tp, "fp": len(false_positives),
+            "fn": len(missed),
+            "raw_acc": overall_raw,
+        },
+        "cells": cells,
+        "missed_tail": missed[-20:],         # GT events with no auto match
+        "false_pos_tail": false_positives[-20:],  # auto events with no GT
+        "matched_tail": matched[-20:],
+    }
+    # Persist to disk so an abrupt server stop doesn't lose the run.
+    # Includes the FULL miss + FP lists (not just the tail) for forensics.
+    try:
+        here = os.path.dirname(os.path.abspath(__file__))
+        rdir = os.path.join(here, "results")
+        os.makedirs(rdir, exist_ok=True)
+        rpath = os.path.join(rdir, _ground_truth["video"] + ".json")
+        on_disk = dict(payload)
+        on_disk["ts"] = time.strftime("%Y-%m-%d %H:%M:%S")
+        on_disk["source"] = "live_run"
+        on_disk["missed_full"] = missed
+        on_disk["false_pos_full"] = false_positives
+        on_disk["matched_full"] = matched
+        # Atomic write so concurrent reads never see a partial file.
+        tmp = rpath + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(on_disk, f, indent=2)
+        os.replace(tmp, rpath)
+    except (OSError, KeyError):
+        pass
+    return jsonify(payload)
+
+
+@app.route("/api/version", methods=["GET"])
+def api_version():
+    """Returns mtime of csrt_tracker.py + app.py + index.html so the
+    dashboard can show whether browser/server are running fresh code."""
+    here = os.path.dirname(os.path.abspath(__file__))
+    files = {
+        "csrt_tracker.py": os.path.join(here, "csrt_tracker.py"),
+        "app.py":          os.path.join(here, "app.py"),
+        "templates/index.html": os.path.join(here, "templates", "index.html"),
+    }
+    out = {}
+    import datetime as _dt
+    for label, path in files.items():
+        if os.path.exists(path):
+            mt = os.path.getmtime(path)
+            out[label] = _dt.datetime.fromtimestamp(mt).strftime(
+                "%Y-%m-%d %H:%M:%S")
+    # Marker we know was added in the dedup commit so we can confirm
+    # the server is running the NEW csrt_tracker code.
+    out["server_has_dedup"] = hasattr(
+        __import__("csrt_tracker").MultiBallTracker(), "dedup_radius_px")
+    return jsonify(out)
+
+
+@app.route("/api/save_snapshot", methods=["POST"])
+def api_save_snapshot():
+    """Save the JSON snapshot the dashboard built to disk under
+    ./snapshots/<timestamp>.txt. Survives browser clipboard failures
+    and gives a permanent record we can grep later."""
+    import time as _t
+    body = request.get_json(silent=True) or {}
+    text = body.get("text", "")
+    if not text:
+        return jsonify({"ok": False, "reason": "empty"}), 400
+    snap_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                            "snapshots")
+    os.makedirs(snap_dir, exist_ok=True)
+    ts = _t.strftime("%Y%m%d-%H%M%S", _t.localtime())
+    fname = f"snap-{ts}.txt"
+    fpath = os.path.join(snap_dir, fname)
+    with open(fpath, "w") as f:
+        f.write(text)
+    print(f"[snap] wrote {fpath} ({len(text)} bytes)", flush=True)
+    return jsonify({"ok": True, "path": fpath, "filename": fname})
 
 
 @app.route("/api/replay/pause", methods=["POST"])
@@ -2453,6 +2959,30 @@ if __name__ == "__main__":
                              "overlays, NO YOLO detection. Use to draw zones, tune "
                              "resolution/quality, and verify camera setup before "
                              "running a real match.")
+    parser.add_argument("--label", action="store_true",
+                        help="Ground-truth labeling mode. NO YOLO/CSRT runs — just "
+                             "the raw video feed + manual count buttons (Q/W/A/S "
+                             "hotkeys). Counts + per-click timestamps save to "
+                             "labels/<videoname>.json. Use to collect ground "
+                             "truth that the auto-counter can later be benchmarked "
+                             "against.")
+    parser.add_argument("--label-speed", type=float, default=0.5,
+                        help="Replay speed multiplier in label mode "
+                             "(default: 0.5 = half-speed so eyes can keep up).")
+    parser.add_argument("--auto-run", action="store_true",
+                        help="Benchmark mode: auto-press START MATCH 1s "
+                             "after the replay loads + auto-exit when the "
+                             "clip ends. Combine with --no-loop. Use this "
+                             "in a batch runner to process every labeled "
+                             "clip without manual clicks.")
+    parser.add_argument("--alliance", choices=["red", "blue", "both"],
+                        default="both",
+                        help="Lock label mode to ONE alliance per pass — "
+                             "the UI hides the other side and hotkeys "
+                             "collapse to two keys (Q=classified, W=overflow). "
+                             "The JSON file holds both alliances; the second "
+                             "pass with the other alliance flag adds to it. "
+                             "'both' (default) = legacy 4-button mode.")
     parser.add_argument("--enhance-roi", action="store_true",
                         help="Apply cheap post-upscale enhancement (cubic + "
                              "unsharp mask + CLAHE) to each alliance ROI crop. "
@@ -2485,6 +3015,64 @@ if __name__ == "__main__":
         _sys.modules[__name__]._debug_mode = True
         print("[DEBUG] Setup/debug mode — NO YOLO detection, zone overlays only")
 
+    if args.auto_run:
+        if not args.replay:
+            raise SystemExit("--auto-run requires --replay (it's for batch benchmarking)")
+        _auto_run = True
+        # Force single-pass replay so we get one clean run per clip.
+        args.no_loop = True
+        # Schedule the match-start: a tiny background thread that waits
+        # for the grab loop to start producing frames, then POSTs the
+        # equivalent of "press START MATCH" via direct global mutation.
+        def _kick_off():
+            # Wait until the grab loop has read the first frame, then
+            # call the same logic that POST /api/match/start runs (so
+            # tripwires are reset to fresh state at frame 0 of source).
+            global _replay_paused
+            time.sleep(2.0)
+            if ramp_tracker_red is not None: ramp_tracker_red.reset()
+            if ramp_tracker_blue is not None: ramp_tracker_blue.reset()
+            if csrt_tracker_red is not None: csrt_tracker_red.reset()
+            if csrt_tracker_blue is not None: csrt_tracker_blue.reset()
+            if hasattr(detector, "reset_tracker"): detector.reset_tracker()
+            scorer_red.unlock_pattern(); scorer_blue.unlock_pattern()
+            scorer_red.update([]); scorer_blue.update([])
+            with match_state_lock:
+                match_state["phase"] = "AUTO"
+                match_state["started_at"] = time.time()
+                match_state["phase_duration"] = 0
+                match_state["auto_snapshot"] = {"red": None, "blue": None}
+                match_state["final_snapshot"] = {"red": None, "blue": None}
+            _replay_paused = False
+            print("[*] --auto-run: match started")
+        threading.Thread(target=_kick_off, daemon=True).start()
+        print("[*] --auto-run enabled — match auto-starts in 2s, "
+              "exits at end of clip")
+
+    if args.label:
+        if not args.replay:
+            raise SystemExit("--label requires --replay (you label against a clip)")
+        _label_mode = True
+        _label_alliance = args.alliance
+        _label_video_basename = os.path.splitext(
+            os.path.basename(args.replay))[0]
+        _label_load()
+        _replay_target_fps = max(1, int(round(30 * args.label_speed)))
+        print(f"[LABEL] Ground-truth labeling mode — alliance: "
+              f"{_label_alliance.upper()}")
+        print(f"        Video: {args.replay}")
+        print(f"        Saving to: labels/{_label_video_basename}.json")
+        print(f"        Resumed: R cls={_label_counts['red']['classified']} "
+              f"ovr={_label_counts['red']['overflow']} | "
+              f"B cls={_label_counts['blue']['classified']} "
+              f"ovr={_label_counts['blue']['overflow']}")
+        print(f"        Speed: {args.label_speed:.2f}x ({_replay_target_fps} fps)")
+        if _label_alliance == "both":
+            print(f"        Hotkeys: Q=R-cls W=R-ovr A=B-cls S=B-ovr Z=undo")
+        else:
+            print(f"        Hotkeys: Q=classified W=overflow Z=undo "
+                  f"(locked to {_label_alliance.upper()})")
+
     if args.live:
         args.replay = None
         args.usb = None
@@ -2507,8 +3095,14 @@ if __name__ == "__main__":
         try:
             model_path = args.yolo_model or config.YOLO_MODEL_PATH
             from yolo_detector import YOLODetector
-            detector = YOLODetector(model_path=model_path)
-            det_mode = f"YOLO ({model_path})"
+            # When using CSRT, disable ultralytics' built-in tracker
+            # (model.track()) — we just want raw detections per frame
+            # and run our own correlation-filter trackers downstream.
+            backend = getattr(config, "TRACKER_BACKEND", "csrt").lower()
+            tracking_enabled = (backend != "csrt")
+            detector = YOLODetector(model_path=model_path,
+                                     tracking_enabled=tracking_enabled)
+            det_mode = f"YOLO ({model_path}) [{backend}]"
         except ImportError as e:
             print(f"[!] Detector init failed (missing dependency): {e}")
             print("    Install ultralytics: pip install ultralytics")
@@ -2521,8 +3115,7 @@ if __name__ == "__main__":
             sys.exit(1)
 
     # Initialize dual tripwire counters (one per alliance).
-    # The old simple/full tracker modes are replaced with the
-    # event-based tripwire counter — see tripwire_counter.py.
+    # Plus per-alliance CSRT MultiBallTracker if TRACKER_BACKEND="csrt".
     try:
         from tripwire_counter import TripwireCounter as _Tracker
         tracker_mode = "TRIPWIRE (event-based gate + overflow counting)"
@@ -2530,9 +3123,50 @@ if __name__ == "__main__":
             memory_frames=int(getattr(config, "TRIPWIRE_TRACK_MEMORY_FRAMES", 600)),
             trail_length=int(getattr(config, "TRIPWIRE_TRAIL_LENGTH", 30)),
             min_track_age_frames=int(getattr(config, "TRIPWIRE_MIN_TRACK_AGE_FRAMES", 5)),
+            settle_motion_threshold_px=float(
+                getattr(config, "TRIPWIRE_SETTLE_MOTION_THRESHOLD_PX", 8.0)),
+            settle_frames_required=int(
+                getattr(config, "TRIPWIRE_SETTLE_FRAMES_REQUIRED", 5)),
+            settled_match_radius_px=float(
+                getattr(config, "TRIPWIRE_SETTLED_MATCH_RADIUS_PX", 30.0)),
+            settled_eviction_frames=int(
+                getattr(config, "TRIPWIRE_SETTLED_EVICTION_FRAMES", 150)),
+            transit_eviction_frames=int(
+                getattr(config, "TRIPWIRE_TRANSIT_EVICTION_FRAMES", 10)),
+            settled_require_color=bool(
+                getattr(config, "TRIPWIRE_SETTLED_REQUIRE_COLOR", True)),
         )
         ramp_tracker_red = _Tracker(**_tk_kwargs)
         ramp_tracker_blue = _Tracker(**_tk_kwargs)
+        # Note: per-clip start_frame gate is applied later, after the
+        # per-clip ROI block runs (it sets _roi_per_clip_path which we
+        # need to know which clip's start_frame to load).
+        # CSRT multi-ball trackers (per alliance). Bypassed when backend
+        # is "bytetrack" — ultralytics' tracker assigns track_ids itself.
+        # (No `global` needed — we're at module level here.)
+        if getattr(config, "TRACKER_BACKEND", "csrt").lower() == "csrt":
+            from csrt_tracker import MultiBallTracker
+            _csrt_kwargs = dict(
+                max_lost_frames=int(getattr(config, "CSRT_MAX_LOST_FRAMES", 30)),
+                match_iou=float(getattr(config, "CSRT_MATCH_IOU", 0.20)),
+                max_frames_without_yolo=int(
+                    getattr(config, "CSRT_MAX_FRAMES_WITHOUT_YOLO", 60)),
+                trail_length=int(getattr(config, "TRIPWIRE_TRAIL_LENGTH", 30)),
+                ghost_max_frames=int(getattr(config, "CSRT_GHOST_MAX_FRAMES", 45)),
+                ghost_match_radius_px=int(
+                    getattr(config, "CSRT_GHOST_MATCH_RADIUS_PX", 40)),
+                ghost_require_color=bool(
+                    getattr(config, "CSRT_GHOST_REQUIRE_COLOR", True)),
+                max_active_tracks=int(
+                    getattr(config, "CSRT_MAX_ACTIVE_TRACKS", 12)),
+                match_center_px=int(
+                    getattr(config, "CSRT_MATCH_CENTER_PX", 35)),
+                dedup_radius_px=int(
+                    getattr(config, "CSRT_DEDUP_RADIUS_PX", 25)),
+            )
+            csrt_tracker_red = MultiBallTracker(**_csrt_kwargs)
+            csrt_tracker_blue = MultiBallTracker(**_csrt_kwargs)
+            print(f"  CSRT: per-ball correlation-filter trackers active")
         print(f"  Tracker: {tracker_mode}")
         # Load saved ROI/tripwire config for each alliance
         roi_data = load_roi_config()
@@ -2551,6 +3185,58 @@ if __name__ == "__main__":
         print("[i] ramp_tracker module not found — using direct detection mode")
         ramp_tracker_red = None
         ramp_tracker_blue = None
+
+    # Per-clip ROI: load/save zones from roi_configs/<clipname>.json so
+    # each clip's camera angle has its own polygons. First-time runs
+    # fall back to the global roi_config.json so you have something to
+    # tweak; once you Save, it writes the per-clip file instead.
+    if args.replay:
+        clip_base = os.path.splitext(os.path.basename(args.replay))[0]
+        _roi_per_clip_path = os.path.join(ROI_CONFIGS_DIR, clip_base + ".json")
+        print(f"[ROI] Per-clip zones file: roi_configs/{clip_base}.json "
+              f"({'exists' if os.path.exists(_roi_per_clip_path) else 'will be created on save'})")
+        # Optional start_frame: tripwires won't fire any counts until
+        # _replay_current_frame >= start_frame. Useful for clips whose
+        # opening seconds have camera shifts / pre-match handling that
+        # would otherwise be counted as false positives.
+        clip_start = 0
+        if os.path.exists(_roi_per_clip_path):
+            try:
+                with open(_roi_per_clip_path) as f:
+                    clip_start = int(json.load(f).get("start_frame", 0))
+            except (json.JSONDecodeError, IOError, ValueError, TypeError):
+                pass
+        if clip_start > 0:
+            print(f"[ROI] start_frame for this clip: {clip_start} "
+                  f"(skip counting until f{clip_start} = ~{clip_start/30.0:.1f}s)")
+            # Apply the gate now that ramp trackers exist (they were
+            # constructed earlier with start_frame=0 by default).
+            if ramp_tracker_red is not None:
+                ramp_tracker_red.start_frame = clip_start
+            if ramp_tracker_blue is not None:
+                ramp_tracker_blue.start_frame = clip_start
+            print(f"[ROI] Tracker gates applied")
+
+    # Auto-load ground-truth labels for this clip if they exist. The
+    # /api/benchmark endpoint then reports live accuracy of auto vs GT.
+    if args.replay:
+        gt_basename = os.path.splitext(os.path.basename(args.replay))[0]
+        gt_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                               "labels", gt_basename + ".json")
+        if os.path.exists(gt_path):
+            try:
+                with open(gt_path) as f:
+                    _ground_truth = json.load(f)
+                gt_red = _ground_truth["counts"]["red"]
+                gt_blue = _ground_truth["counts"]["blue"]
+                print(f"[GT] Loaded ground truth: labels/{gt_basename}.json")
+                print(f"     R cls={gt_red['classified']} ovr={gt_red['overflow']} | "
+                      f"B cls={gt_blue['classified']} ovr={gt_blue['overflow']} | "
+                      f"events={len(_ground_truth.get('events', []))}")
+            except (json.JSONDecodeError, KeyError, OSError) as e:
+                print(f"[GT] Could not load {gt_path}: {e}")
+        else:
+            print(f"[GT] No labels file at {gt_path} — benchmark disabled.")
 
     # Determine camera mode
     if args.replay:

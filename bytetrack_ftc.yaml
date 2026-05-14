@@ -26,7 +26,7 @@ track_high_thresh: 0.40
 # contain anything. With YOLO_CONFIDENCE=0.05, this 0.06 floor means
 # "any detection above 0.06 confidence can be used for recovery,"
 # giving ByteTrack the maximum amount of weak-detection signal.
-track_low_thresh: 0.06
+track_low_thresh: 0.21
 
 # Confidence required to start a brand-new track. Brand-new tracks
 # need to be reasonably confident or we'll spawn phantom tracks on
