@@ -133,10 +133,69 @@ def _stack_with_labels(images, labels, label_h=18):
     return np.hstack(out_imgs)
 
 
+def _load_yolo_bboxes(label_path):
+    """Read a YOLO label file. Returns list of (class_id, xc, yc, w, h)
+    in NORMALIZED 0-1 coords, or [] if file missing/empty."""
+    if not os.path.isfile(label_path):
+        return []
+    boxes = []
+    try:
+        for line in open(label_path):
+            parts = line.strip().split()
+            if len(parts) < 5:
+                continue
+            cls, xc, yc, w, h = int(parts[0]), float(parts[1]), float(parts[2]), \
+                float(parts[3]), float(parts[4])
+            boxes.append((cls, xc, yc, w, h))
+    except Exception:
+        return []
+    return boxes
+
+
+def _draw_bboxes(img, bboxes, scale=1.0):
+    """Draw YOLO normalized bboxes onto img. If scale<1.0, the image
+    content has been shrunk to scale and centered on a same-size canvas
+    (the _ShrinkAndPadCls transform); transform bbox positions to match.
+
+    Class colors: 0 (green_ball) → green, 1 (purple_ball) → magenta.
+    """
+    if not bboxes:
+        return img
+    h, w = img.shape[:2]
+    for cls, xc, yc, bw, bh in bboxes:
+        if scale != 1.0:
+            # _ShrinkAndPadCls centers the scaled content on the canvas
+            offset = (1.0 - scale) / 2.0
+            xc = scale * xc + offset
+            yc = scale * yc + offset
+            bw *= scale
+            bh *= scale
+        x1 = int((xc - bw / 2) * w)
+        y1 = int((yc - bh / 2) * h)
+        x2 = int((xc + bw / 2) * w)
+        y2 = int((yc + bh / 2) * h)
+        color = (0, 255, 0) if cls == 0 else (200, 0, 200)
+        cv2.rectangle(img, (x1, y1), (x2, y2), color, 1)
+    return img
+
+
+# Per-augmentation bbox-scale factor. Anything that just modifies pixel
+# values (blur, compression, gray, clahe) keeps bboxes at scale=1.0.
+# scale_down_X.Yx columns shrink content by X.Y so bboxes scale too.
+# full_pipeline applies scale=0.5 first then blur+compression.
+_BBOX_SCALE_BY_NAME = {
+    "scale_down_0.4x": 0.4,
+    "scale_down_0.6x": 0.6,
+}
+
+
 def render_synthetic_samples(n_samples=8):
     """Pick N random training images, apply each augmentation alone +
-    the full pipeline, and write side-by-side previews."""
+    the full pipeline, and write side-by-side previews. Now also draws
+    YOLO bboxes on every panel so you can verify the labels still wrap
+    the ball after each transform."""
     train_img_dir = os.path.join(TRAINING_DIR, "images", "train")
+    label_dir = os.path.join(TRAINING_DIR, "labels", "train")
     if not os.path.isdir(train_img_dir):
         print(f"[!] No training images at {train_img_dir}")
         return []
@@ -145,22 +204,41 @@ def render_synthetic_samples(n_samples=8):
     if not candidates:
         print(f"[!] No image files in {train_img_dir}")
         return []
-    sampled = random.sample(candidates, min(n_samples, len(candidates)))
+    # Bias toward images that actually have labels — empty backgrounds
+    # would defeat the visual check.
+    candidates_with_labels = [
+        f for f in candidates
+        if _load_yolo_bboxes(os.path.join(label_dir,
+                                          os.path.splitext(f)[0] + ".txt"))
+    ]
+    pool = candidates_with_labels or candidates
+    sampled = random.sample(pool, min(n_samples, len(pool)))
     pipeline = _load_aug_pipeline_individual()
 
     out_paths = []
     for i, fname in enumerate(sampled):
         path = os.path.join(train_img_dir, fname)
+        label_path = os.path.join(label_dir,
+                                  os.path.splitext(fname)[0] + ".txt")
+        bboxes = _load_yolo_bboxes(label_path)
         img = cv2.imread(path)
         if img is None:
             continue
         rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-        panels = [img.copy()]
-        labels = ["original"]
+        # Original (with bboxes drawn)
+        orig_with_box = _draw_bboxes(img.copy(), bboxes, scale=1.0)
+        panels = [orig_with_box]
+        labels = [f"original ({len(bboxes)} boxes)"]
         for name, compose in pipeline:
             try:
                 out = compose(image=rgb)["image"]
-                panels.append(cv2.cvtColor(out, cv2.COLOR_RGB2BGR))
+                panel = cv2.cvtColor(out, cv2.COLOR_RGB2BGR)
+                # Determine bbox scale for this transform.
+                bbox_scale = _BBOX_SCALE_BY_NAME.get(name, 1.0)
+                if "full_pipeline" in name:
+                    bbox_scale = 0.5  # full_pipeline uses _ShrinkAndPadCls(0.5)
+                _draw_bboxes(panel, bboxes, scale=bbox_scale)
+                panels.append(panel)
                 labels.append(name)
             except Exception as e:
                 print(f"[!] {name} failed: {e}")

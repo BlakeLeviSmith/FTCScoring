@@ -1,0 +1,774 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>HSV Ball Counter</title>
+<style>
+  body { font-family: -apple-system, monospace; background: #0f0f1a;
+         color: #e0e0e0; margin: 0; padding: 20px; }
+  h1 { font-size: 1.4em; margin: 0 0 12px; color: #7a8eff; }
+  .container { max-width: 1400px; margin: 0 auto; }
+  .stage { position: relative; display: inline-block; cursor: crosshair;
+           border: 2px solid #2a2f4a; border-radius: 6px; overflow: hidden; }
+  #feed { display: block; max-width: 100%; height: auto; user-select: none; }
+  #overlay { position: absolute; top: 0; left: 0; pointer-events: none; }
+  .row { margin-top: 12px; display: flex; gap: 8px;
+         align-items: center; flex-wrap: wrap; }
+  button { background: #16213e; color: #fff; border: 1px solid #3a6ea5;
+           padding: 8px 16px; cursor: pointer; font-family: inherit;
+           font-size: 0.9em; border-radius: 4px; }
+  button:hover { background: #1e2a4f; }
+  button.purple { border-color: #c050ff; color: #c050ff; }
+  button.purple.active { background: #c050ff; color: #000; }
+  button.green  { border-color: #50e090; color: #50e090; }
+  button.green.active  { background: #50e090; color: #000; }
+  button.line   { border-color: #ffb700; color: #ffb700; }
+  button.line.active   { background: #ffb700; color: #000; }
+  button.danger { border-color: #c93333; color: #ff6464; }
+  button:disabled { opacity: 0.4; cursor: not-allowed; }
+  .pill { display: inline-block; padding: 2px 8px; border-radius: 10px;
+          font-size: 0.75em; background: #2a2f4a; color: #888; }
+  .pill.done { background: #163e2a; color: #4ade80; border: 1px solid #4ade80; }
+  #scrub { flex: 1; min-width: 240px; accent-color: #7a8eff; }
+  .stat { background: #16213e; padding: 6px 12px; border-radius: 4px;
+          font-size: 0.85em; }
+  .stat .num { font-size: 1.4em; font-weight: 600; margin-left: 6px; }
+  .stat.purple .num { color: #c050ff; }
+  .stat.green .num { color: #50e090; }
+  .hint { color: #888; font-size: 0.85em; margin: 8px 0 4px; min-height: 1.2em; }
+  #calib-panel { display: none; background: #16213e; padding: 10px 16px;
+                 margin-top: 8px; border-radius: 6px; gap: 12px;
+                 align-items: center; flex-wrap: wrap; }
+  #calib-panel.show { display: flex; }
+  #calib-panel input[type=range] { accent-color: #7a8eff; min-width: 200px; }
+  #calib-panel .swatch { width: 24px; height: 24px; border-radius: 50%;
+                         border: 2px solid #fff; }
+</style>
+</head>
+<body>
+<div class="container">
+  <h1 id="page-title">HSV Ball Counter</h1>
+
+  <!-- Label-mode banner: shown only when --label was passed. Auto
+       detection is OFF; this is pure ground-truth click-counting. -->
+  <div id="label-banner" style="display:none; padding:10px 14px;
+        background:#102a3a; border:1px solid #3cc0ff; border-radius:6px;
+        color:#3cc0ff; margin-bottom:12px; font-weight:600;">
+    📋 LABEL MODE — auto-counter is disabled. Press Play, watch the video,
+    click +1 (or use Q/W/A/S) every time you see a ball cross.
+    Counts are saved to disk after every click.
+  </div>
+
+  <!-- Source warning: shown when saved manual counts came from a
+       DIFFERENT video than the one currently loaded. -->
+  <div id="src-warning" style="display:none; padding:10px 14px;
+        background:#3a2010; border:1px solid #c93333; border-radius:6px;
+        color:#ffb070; margin-bottom:12px;">
+  </div>
+
+  <div class="row auto-only">
+    <span>Calibration:</span>
+    <button class="purple" id="btn-cal-purple" onclick="startCalibrate('purple')">
+      1. Calibrate purple <span class="pill" id="pill-purple">size + color</span>
+    </button>
+    <button class="green" id="btn-cal-green" onclick="startCalibrate('green')">
+      2. Calibrate green <span class="pill" id="pill-green">color only</span>
+    </button>
+    <button class="line" id="btn-line-classified" onclick="startMode('line-classified')">
+      3a. Classified line <span class="pill" id="pill-line-classified">2 clicks</span>
+    </button>
+    <button class="line" id="btn-line-overflow" onclick="startMode('line-overflow')">
+      3b. Overflow line <span class="pill" id="pill-line-overflow">2 clicks</span>
+    </button>
+    <button class="danger" onclick="clearCalibration()">Clear all</button>
+  </div>
+  <div class="hint auto-only" id="mode-hint">Pause + scrub to a frame with a still ball, then click step 1.</div>
+
+  <!-- In LABEL mode the calibration row collapses; we still need to
+       let the user draw the lines so they have a visual reference for
+       counting. This pared-down row only shows the line buttons. -->
+  <div class="row label-only" style="display:none;">
+    <span>Lines (visual reference for counting):</span>
+    <button class="line" onclick="startMode('line-classified')">
+      Draw classified line
+    </button>
+    <button class="line" onclick="startMode('line-overflow')">
+      Draw overflow line
+    </button>
+    <button class="danger" onclick="clearCalibration()">Clear all</button>
+  </div>
+
+  <!-- Inline panel, only shown while a calibration circle is being adjusted -->
+  <div id="calib-panel">
+    <span>Drawing:</span>
+    <span class="swatch" id="calib-swatch"></span>
+    <span id="calib-color-label" style="font-weight:600;">PURPLE</span>
+    <label>radius: <span id="calib-r-display">24</span> px</label>
+    <input type="range" id="calib-r" min="4" max="120" value="24"
+           oninput="onRadiusChange(this.value)">
+    <button onclick="confirmCalibration()" style="background:#163e2a;border-color:#4ade80;color:#4ade80;">
+      ✓ Confirm
+    </button>
+    <button onclick="cancelCalibration()">Cancel</button>
+    <span class="hint" id="calib-hint" style="margin:0;">
+      Click on a ball to place the circle. Adjust radius until it just covers ONE ball.
+    </span>
+  </div>
+
+  <div class="stage" id="stage">
+    <img id="feed" src="/video_feed" alt="video">
+    <canvas id="overlay"></canvas>
+  </div>
+
+  <div class="row">
+    <button id="play-btn" onclick="togglePlay()">▶ Play</button>
+    <input type="range" id="scrub" min="0" max="1000" value="0"
+           oninput="onScrubInput(this)" onchange="onScrubChange(this)">
+    <span id="frame-display" class="stat">frame 0 / 0</span>
+    <!-- Playback speed: defaults to 0.5x in label mode so your eyes
+         can keep up; defaults to 1x in normal mode. -->
+    <label class="stat">
+      speed
+      <input type="range" id="speed" min="0.1" max="2.0" step="0.05" value="1.0"
+             oninput="onSpeedChange()" style="width:120px;vertical-align:middle;">
+      <span id="speed-val">1.00</span>x
+    </label>
+    <button class="auto-only" onclick="resetCount()">Reset count</button>
+  </div>
+
+  <!-- Ground-truth + accuracy panel. Click +1 every time YOU see a
+       ball cross the matching line, so the system can show how well
+       auto-count is tracking against your eyes. -->
+  <div style="margin-top: 16px; display: flex; gap: 12px; flex-wrap: wrap;">
+    <div style="background: #16213e; padding: 12px 16px; border-radius: 6px;
+                border: 1px solid #ffb700;">
+      <div style="font-weight:600; color:#ffb700; margin-bottom:6px;">
+        CLASSIFIED LINE (entry)
+      </div>
+      <table style="border-collapse: collapse;">
+        <thead>
+          <tr style="color:#888; font-size:0.75em;">
+            <th></th>
+            <th class="auto-only" style="padding:0 8px;">auto</th>
+            <th style="padding:0 8px;">manual</th>
+            <th class="auto-only" style="padding:0 8px;">acc</th>
+            <th style="padding:0 12px;">±</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td style="color:#c050ff; font-weight:600; padding:4px 8px 4px 0;">PURPLE</td>
+            <td class="auto-only" style="font-size:1.3em; text-align:center;" id="auto-classified-purple">0</td>
+            <td style="font-size:1.3em; text-align:center;" id="manual-classified-purple">0</td>
+            <td class="auto-only" style="text-align:center;" id="acc-classified-purple">—</td>
+            <td>
+              <button onclick="manual('classified','purple',+1)" style="background:#c050ff;color:#000;font-weight:600;">+1</button>
+              <button onclick="manual('classified','purple',-1)">−</button>
+            </td>
+          </tr>
+          <tr>
+            <td style="color:#50e090; font-weight:600; padding:4px 8px 4px 0;">GREEN</td>
+            <td class="auto-only" style="font-size:1.3em; text-align:center;" id="auto-classified-green">0</td>
+            <td style="font-size:1.3em; text-align:center;" id="manual-classified-green">0</td>
+            <td class="auto-only" style="text-align:center;" id="acc-classified-green">—</td>
+            <td>
+              <button onclick="manual('classified','green',+1)" style="background:#50e090;color:#000;font-weight:600;">+1</button>
+              <button onclick="manual('classified','green',-1)">−</button>
+            </td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div style="background: #16213e; padding: 12px 16px; border-radius: 6px;
+                border: 1px solid #3cc0ff;">
+      <div style="font-weight:600; color:#3cc0ff; margin-bottom:6px;">
+        OVERFLOW LINE
+      </div>
+      <table style="border-collapse: collapse;">
+        <thead>
+          <tr style="color:#888; font-size:0.75em;">
+            <th></th>
+            <th class="auto-only" style="padding:0 8px;">auto</th>
+            <th style="padding:0 8px;">manual</th>
+            <th class="auto-only" style="padding:0 8px;">acc</th>
+            <th style="padding:0 12px;">±</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td style="color:#c050ff; font-weight:600; padding:4px 8px 4px 0;">PURPLE</td>
+            <td class="auto-only" style="font-size:1.3em; text-align:center;" id="auto-overflow-purple">0</td>
+            <td style="font-size:1.3em; text-align:center;" id="manual-overflow-purple">0</td>
+            <td class="auto-only" style="text-align:center;" id="acc-overflow-purple">—</td>
+            <td>
+              <button onclick="manual('overflow','purple',+1)" style="background:#c050ff;color:#000;font-weight:600;">+1</button>
+              <button onclick="manual('overflow','purple',-1)">−</button>
+            </td>
+          </tr>
+          <tr>
+            <td style="color:#50e090; font-weight:600; padding:4px 8px 4px 0;">GREEN</td>
+            <td class="auto-only" style="font-size:1.3em; text-align:center;" id="auto-overflow-green">0</td>
+            <td style="font-size:1.3em; text-align:center;" id="manual-overflow-green">0</td>
+            <td class="auto-only" style="text-align:center;" id="acc-overflow-green">—</td>
+            <td>
+              <button onclick="manual('overflow','green',+1)" style="background:#50e090;color:#000;font-weight:600;">+1</button>
+              <button onclick="manual('overflow','green',-1)">−</button>
+            </td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div style="background: #16213e; padding: 12px 16px; border-radius: 6px;
+                display: flex; flex-direction: column; gap: 6px;">
+      <div style="font-weight:600;">REFERENCE</div>
+      <div class="stat auto-only">BALL AREA <span id="area-display">--</span> px</div>
+      <div class="stat auto-only">PURPLE HSV <span id="hsv-purple">--</span></div>
+      <div class="stat auto-only">GREEN HSV  <span id="hsv-green">--</span></div>
+      <div class="stat">CLASSIFIED LINE <span id="line-classified-display">--</span></div>
+      <div class="stat">OVERFLOW LINE <span id="line-overflow-display">--</span></div>
+      <button onclick="resetManual()" style="margin-top:4px;">Reset manual only</button>
+    </div>
+  </div>
+
+  <!-- Live HSV tolerance + view-mode toggles. Use these to debug
+       overcounting: if the mask is grabbing background, tighten the
+       sliders until only ball pixels show in mask-only mode. -->
+  <div class="row auto-only" style="margin-top: 16px; padding: 10px 12px;
+                          background: #16213e; border-radius: 6px;">
+    <span style="font-weight:600;">HSV tolerance</span>
+    <label>H ±<span id="tol-h-val">15</span>
+      <input type="range" id="tol-h" min="2" max="40" value="15"
+             oninput="onTolChange()"></label>
+    <label>S ±<span id="tol-s-val">70</span>
+      <input type="range" id="tol-s" min="10" max="120" value="70"
+             oninput="onTolChange()"></label>
+    <label>V ±<span id="tol-v-val">70</span>
+      <input type="range" id="tol-v" min="10" max="120" value="70"
+             oninput="onTolChange()"></label>
+    <span>·</span>
+    <!-- Mask-closing radius: bridges gaps in the HSV mask. If a metal
+         rod or stripe runs through a ball, its non-color pixels split
+         the ball into multiple connected components. Raising this
+         radius fills the gap and re-merges the halves. -->
+    <label title="Bridges mask gaps caused by rods/stripes running through balls. ~half the gap width.">
+      close ±<span id="close-r-val">4</span>px
+      <input type="range" id="close-r" min="0" max="15" value="4"
+             oninput="onCloseChange()"></label>
+    <span>·</span>
+    <!-- Aspect filter: rejects motion-blur slugs (very tall+thin or
+         wide+short blobs) before they're counted. -->
+    <label title="Rejects elongated blobs (motion-blur trails). Real balls are roughly square.">
+      aspect [<span id="aspect-lo-val">0.5</span>..<span id="aspect-hi-val">2.0</span>]
+      <input type="range" id="aspect-lo" min="0.1" max="1.0" step="0.05" value="0.5"
+             oninput="onAspectChange()" style="width:80px;">
+      <input type="range" id="aspect-hi" min="1.0" max="5.0" step="0.05" value="2.0"
+             oninput="onAspectChange()" style="width:80px;"></label>
+    <span>·</span>
+    <!-- Cooldown: suppresses repeat crossings of the same blob within
+         N frames at the same spatial location. Stops motion-trail
+         double-counts. radius is in ball-diameter multiples. -->
+    <label title="After a crossing fires, suppress new crossings near the same spot for N frames.">
+      cooldown <span id="cool-f-val">5</span>f / <span id="cool-r-val">1.0</span>×ball
+      <input type="range" id="cool-f" min="0" max="30" value="5"
+             oninput="onCooldownChange()" style="width:80px;">
+      <input type="range" id="cool-r" min="0.0" max="3.0" step="0.1" value="1.0"
+             oninput="onCooldownChange()" style="width:80px;"></label>
+    <span>·</span>
+    <span style="font-weight:600;">View</span>
+    <button id="view-normal" class="active" onclick="setViewMode('normal')">Normal</button>
+    <button id="view-mask"   onclick="setViewMode('mask')">Mask only</button>
+  </div>
+
+  <!-- Crossing event log: every count change shows its frame, color,
+       blob area, and the area/ball_area ratio that drove the +N.
+       Spot the bad ones by comparing blob_area to a single ball's area. -->
+  <div class="auto-only" style="margin-top: 16px; padding: 10px 12px; background: #16213e;
+              border-radius: 6px;">
+    <div style="font-weight:600; margin-bottom:6px;">
+      Crossing events
+      <span style="float:right; color:#888; font-weight:normal; font-size:0.85em;">
+        most recent at top · clears on Reset
+      </span>
+    </div>
+    <div id="cross-log" style="font-family:monospace; font-size:0.8em;
+              max-height: 240px; overflow-y: auto;">
+      <div style="color:#666;">No crossings yet.</div>
+    </div>
+  </div>
+</div>
+
+<script>
+// ------------ State ------------
+// mode is one of: null (just viewing), 'calib-purple', 'calib-green', 'line'
+let mode = null;
+let calibCircle = null;     // { x, y, r } in source-image coords
+let lineDraft = [];         // [[x,y], [x,y]] in source-image coords
+let totalFrames = 0;
+
+// ------------ DOM refs ------------
+const feed = document.getElementById('feed');
+const overlay = document.getElementById('overlay');
+const hintEl = document.getElementById('mode-hint');
+const calibPanel = document.getElementById('calib-panel');
+const calibSwatch = document.getElementById('calib-swatch');
+const calibLabel = document.getElementById('calib-color-label');
+const calibR = document.getElementById('calib-r');
+const calibRDisplay = document.getElementById('calib-r-display');
+const calibHint = document.getElementById('calib-hint');
+
+// ------------ Display ↔ source coord helpers ------------
+function syncOverlaySize() {
+  overlay.width = feed.clientWidth;
+  overlay.height = feed.clientHeight;
+}
+feed.addEventListener('load', syncOverlaySize);
+window.addEventListener('resize', () => { syncOverlaySize(); redraw(); });
+
+function eventToImageCoords(ev) {
+  const rect = feed.getBoundingClientRect();
+  const sx = (feed.naturalWidth || 1) / rect.width;
+  const sy = (feed.naturalHeight || 1) / rect.height;
+  return {
+    x: Math.round((ev.clientX - rect.left) * sx),
+    y: Math.round((ev.clientY - rect.top) * sy),
+  };
+}
+function srcToDisplayScale() {
+  return {
+    sx: overlay.width / (feed.naturalWidth || 1),
+    sy: overlay.height / (feed.naturalHeight || 1),
+  };
+}
+
+// ------------ Mode + UI ------------
+function startCalibrate(color) {
+  mode = 'calib-' + color;
+  calibCircle = null;
+  lineDraft = [];
+  calibPanel.classList.add('show');
+  calibLabel.textContent = color.toUpperCase();
+  calibSwatch.style.background = color === 'purple' ? '#c050ff' : '#50e090';
+  if (color === 'purple') {
+    calibHint.textContent = 'Click a still PURPLE ball. The circle defines BOTH the color sample (mean HSV inside) AND the per-ball pixel size (πr²).';
+  } else {
+    calibHint.textContent = 'Click any GREEN ball. Only the COLOR is sampled — radius doesn\'t need to be perfect since size is already calibrated from purple.';
+  }
+  // mark active button
+  ['btn-cal-purple','btn-cal-green','btn-line'].forEach(id =>
+    document.getElementById(id).classList.remove('active'));
+  document.getElementById('btn-cal-' + color).classList.add('active');
+  redraw();
+}
+
+const ALL_MODE_BTNS = ['btn-cal-purple','btn-cal-green',
+                       'btn-line-classified','btn-line-overflow'];
+
+function startMode(m) {
+  mode = m;
+  calibCircle = null;
+  lineDraft = [];
+  calibPanel.classList.remove('show');
+  ALL_MODE_BTNS.forEach(id => document.getElementById(id).classList.remove('active'));
+  if (m === 'line-classified') {
+    document.getElementById('btn-line-classified').classList.add('active');
+    hintEl.textContent = 'Click two points to draw the CLASSIFIED line (gate entry).';
+  } else if (m === 'line-overflow') {
+    document.getElementById('btn-line-overflow').classList.add('active');
+    hintEl.textContent = 'Click two points to draw the OVERFLOW line (below the gate).';
+  }
+  redraw();
+}
+
+function endMode() {
+  mode = null;
+  calibCircle = null;
+  lineDraft = [];
+  calibPanel.classList.remove('show');
+  ALL_MODE_BTNS.forEach(id => document.getElementById(id).classList.remove('active'));
+  redraw();
+}
+
+// ------------ Click handler on the video ------------
+feed.addEventListener('click', (ev) => {
+  if (!mode) return;
+  const { x, y } = eventToImageCoords(ev);
+  if (mode === 'calib-purple' || mode === 'calib-green') {
+    if (!calibCircle) {
+      calibCircle = { x, y, r: parseInt(calibR.value, 10) };
+    } else {
+      // re-clicking moves the center
+      calibCircle.x = x;
+      calibCircle.y = y;
+    }
+    redraw();
+  } else if (mode === 'line-classified' || mode === 'line-overflow') {
+    lineDraft.push([x, y]);
+    redraw();
+    if (lineDraft.length === 2) {
+      const which = mode === 'line-classified' ? 'classified' : 'overflow';
+      fetch('/api/line', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ which, points: lineDraft }),
+      }).then(() => { endMode(); updateState(); });
+    }
+  }
+});
+
+function onRadiusChange(v) {
+  calibRDisplay.textContent = v;
+  if (calibCircle) {
+    calibCircle.r = parseInt(v, 10);
+    redraw();
+  }
+}
+
+function confirmCalibration() {
+  if (!calibCircle) {
+    calibHint.textContent = 'Click on a ball first.';
+    return;
+  }
+  const color = mode === 'calib-purple' ? 'purple' : 'green';
+  const set_size = (color === 'purple');
+  fetch('/api/calibrate_color', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      color, x: calibCircle.x, y: calibCircle.y, r: calibCircle.r,
+      set_size,
+    }),
+  }).then(r => r.json()).then(d => {
+    if (d.ok) {
+      hintEl.textContent =
+        `Calibrated ${d.color}. HSV=[${d.hsv.join(',')}]` +
+        (d.set_size ? ` · ball_area=${d.ball_area_px}px` : '');
+      endMode();
+      updateState();
+    } else {
+      calibHint.textContent = 'Failed: ' + (d.reason || 'unknown');
+    }
+  });
+}
+
+function cancelCalibration() {
+  endMode();
+}
+
+// ------------ Overlay drawing ------------
+function redraw() {
+  syncOverlaySize();
+  const ctx = overlay.getContext('2d');
+  ctx.clearRect(0, 0, overlay.width, overlay.height);
+
+  // Calibration circle preview
+  if (calibCircle && (mode === 'calib-purple' || mode === 'calib-green')) {
+    const { sx, sy } = srcToDisplayScale();
+    ctx.strokeStyle = mode === 'calib-purple' ? '#c050ff' : '#50e090';
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.arc(calibCircle.x * sx, calibCircle.y * sy,
+            calibCircle.r * Math.min(sx, sy), 0, Math.PI * 2);
+    ctx.stroke();
+    // crosshair at center
+    ctx.beginPath();
+    ctx.moveTo(calibCircle.x * sx - 6, calibCircle.y * sy);
+    ctx.lineTo(calibCircle.x * sx + 6, calibCircle.y * sy);
+    ctx.moveTo(calibCircle.x * sx, calibCircle.y * sy - 6);
+    ctx.lineTo(calibCircle.x * sx, calibCircle.y * sy + 6);
+    ctx.stroke();
+  }
+
+  // Line draft markers (color matches the line being drawn)
+  if (lineDraft.length && (mode === 'line-classified' || mode === 'line-overflow')) {
+    const { sx, sy } = srcToDisplayScale();
+    const c = mode === 'line-classified' ? '#ffb700' : '#3cc0ff';
+    ctx.fillStyle = c; ctx.strokeStyle = c; ctx.lineWidth = 2;
+    for (const p of lineDraft) {
+      ctx.beginPath();
+      ctx.arc(p[0] * sx, p[1] * sy, 6, 0, Math.PI * 2);
+      ctx.fill();
+    }
+    if (lineDraft.length === 2) {
+      ctx.beginPath();
+      ctx.moveTo(lineDraft[0][0] * sx, lineDraft[0][1] * sy);
+      ctx.lineTo(lineDraft[1][0] * sx, lineDraft[1][1] * sy);
+      ctx.stroke();
+    }
+  }
+}
+
+// ------------ Playback controls ------------
+function togglePlay() {
+  fetch('/api/play_pause', { method: 'POST' })
+    .then(r => r.json()).then(d => updatePlayBtn(d.paused));
+}
+function updatePlayBtn(paused) {
+  document.getElementById('play-btn').textContent = paused ? '▶ Play' : '⏸ Pause';
+}
+
+let _speedTimer = null;
+function onSpeedChange() {
+  const v = parseFloat(document.getElementById('speed').value);
+  document.getElementById('speed-val').textContent = v.toFixed(2);
+  if (_speedTimer) clearTimeout(_speedTimer);
+  _speedTimer = setTimeout(() => {
+    fetch('/api/set_speed', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ speed: v }),
+    });
+  }, 80);
+}
+
+let _scrubbing = false;
+function onScrubInput(el) { _scrubbing = true; }
+function onScrubChange(el) {
+  fetch('/api/seek', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ frame: parseInt(el.value, 10) }),
+  }).then(() => { _scrubbing = false; });
+}
+
+function resetCount() {
+  fetch('/api/reset_count', { method: 'POST' }).then(() => {
+    _crossSeq = 0;
+    _crossBuf.length = 0;
+    document.getElementById('cross-log').innerHTML =
+      '<div style="color:#666;">No crossings yet.</div>';
+    updateState();
+  });
+}
+
+function resetManual() {
+  fetch('/api/reset_manual', { method: 'POST' }).then(updateState);
+}
+
+function manual(line, color, delta) {
+  fetch('/api/manual_increment', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ line, color, delta }),
+  }).then(updateState);
+}
+
+// Keyboard shortcuts so you can click +1 without taking your eyes off
+// the video. Q/W = classified P/G, A/S = overflow P/G. Z undoes last.
+let _lastManual = null;
+window.addEventListener('keydown', (ev) => {
+  if (ev.target.tagName === 'INPUT' || ev.target.tagName === 'BUTTON') return;
+  let action = null;
+  if (ev.key === 'q' || ev.key === 'Q') action = ['classified', 'purple', +1];
+  else if (ev.key === 'w' || ev.key === 'W') action = ['classified', 'green', +1];
+  else if (ev.key === 'a' || ev.key === 'A') action = ['overflow', 'purple', +1];
+  else if (ev.key === 's' || ev.key === 'S') action = ['overflow', 'green', +1];
+  else if (ev.key === 'z' || ev.key === 'Z') {
+    if (_lastManual) {
+      manual(_lastManual[0], _lastManual[1], -1);
+      _lastManual = null;
+    }
+    return;
+  }
+  if (!action) return;
+  ev.preventDefault();
+  manual(...action);
+  _lastManual = action;
+});
+function clearCalibration() {
+  if (!confirm('Clear ALL calibrations + line + counts?')) return;
+  fetch('/api/clear_calibration', { method: 'POST' }).then(updateState);
+}
+
+// ------------ Tolerance + view mode ------------
+let _tolTimer = null;
+function onTolChange() {
+  const dh = document.getElementById('tol-h').value;
+  const ds = document.getElementById('tol-s').value;
+  const dv = document.getElementById('tol-v').value;
+  document.getElementById('tol-h-val').textContent = dh;
+  document.getElementById('tol-s-val').textContent = ds;
+  document.getElementById('tol-v-val').textContent = dv;
+  // Debounce so dragging the slider doesn't spam POSTs
+  if (_tolTimer) clearTimeout(_tolTimer);
+  _tolTimer = setTimeout(() => {
+    fetch('/api/set_tolerance', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ dh: +dh, ds: +ds, dv: +dv }),
+    });
+  }, 80);
+}
+
+let _closeTimer = null;
+function onCloseChange() {
+  const r = document.getElementById('close-r').value;
+  document.getElementById('close-r-val').textContent = r;
+  if (_closeTimer) clearTimeout(_closeTimer);
+  _closeTimer = setTimeout(() => {
+    fetch('/api/set_close_radius', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ r: +r }),
+    });
+  }, 80);
+}
+
+function setViewMode(m) {
+  fetch('/api/set_view_mode', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ mode: m }),
+  });
+  document.getElementById('view-normal').classList.toggle('active', m === 'normal');
+  document.getElementById('view-mask').classList.toggle('active', m === 'mask');
+}
+
+// ------------ Crossing event log ------------
+let _crossSeq = 0;
+const _crossBuf = [];
+const CROSS_LOG_MAX = 60;
+
+function _crossLine(ev) {
+  const color = ev.color === 'purple' ? '#c050ff' : '#50e090';
+  const flag = (ev.area_ratio > 1.4 || ev.area_ratio < 0.7)
+    ? ' <span style="color:#ffb700;">⚠</span>' : '';
+  return `<div style="color:${color}; margin: 2px 0;">
+    f${ev.frame} +${ev.n_balls} ${ev.color}
+    · area=${ev.blob_area}/${ev.ball_area}
+    · ratio=${ev.area_ratio}${flag}
+    · box=${ev.box[2]}×${ev.box[3]}
+    · total=${ev.count_after}
+  </div>`;
+}
+
+function appendCrossings(events) {
+  if (!events || !events.length) return;
+  for (const ev of events) {
+    _crossBuf.unshift(ev);  // newest first
+    if (ev.seq > _crossSeq) _crossSeq = ev.seq;
+  }
+  while (_crossBuf.length > CROSS_LOG_MAX) _crossBuf.pop();
+  document.getElementById('cross-log').innerHTML =
+    _crossBuf.map(_crossLine).join('') || '<div style="color:#666;">No crossings yet.</div>';
+}
+
+// ------------ State sync ------------
+function fmtAcc(a) {
+  if (a === null || a === undefined) return '—';
+  return Math.round(a * 100) + '%';
+}
+
+let _modeApplied = null;
+function applyModeUI(label_mode) {
+  if (_modeApplied === label_mode) return;
+  _modeApplied = label_mode;
+  document.querySelectorAll('.auto-only').forEach(el =>
+    el.style.display = label_mode ? 'none' : '');
+  document.querySelectorAll('.label-only').forEach(el =>
+    el.style.display = label_mode ? '' : 'none');
+  document.getElementById('label-banner').style.display =
+    label_mode ? 'block' : 'none';
+  document.getElementById('page-title').textContent =
+    label_mode ? 'HSV Ball Counter — LABEL MODE'
+               : 'HSV Ball Counter';
+}
+
+function updateState() {
+  fetch('/api/state?since_cross_seq=' + _crossSeq).then(r => r.json()).then(d => {
+    applyModeUI(!!d.label_mode);
+    // Sync speed slider with server state
+    if (typeof d.playback_speed === 'number') {
+      const speedEl = document.getElementById('speed');
+      if (speedEl && Math.abs(parseFloat(speedEl.value) - d.playback_speed) > 0.01
+          && document.activeElement !== speedEl) {
+        speedEl.value = d.playback_speed;
+        document.getElementById('speed-val').textContent =
+          d.playback_speed.toFixed(2);
+      }
+    }
+    appendCrossings(d.crossings);
+    // Per-line per-color auto/manual/accuracy fill
+    for (const line of ['classified', 'overflow']) {
+      for (const color of ['purple', 'green']) {
+        const auto = (d.count?.[line]?.[color]) ?? 0;
+        const manual = (d.manual_count?.[line]?.[color]) ?? 0;
+        const acc = (d.accuracy?.[line]?.[color]) ?? null;
+        document.getElementById(`auto-${line}-${color}`).textContent = auto;
+        document.getElementById(`manual-${line}-${color}`).textContent = manual;
+        const accEl = document.getElementById(`acc-${line}-${color}`);
+        accEl.textContent = fmtAcc(acc);
+        accEl.style.color = acc === null ? '#888'
+          : acc >= 0.9 ? '#4ade80'
+          : acc >= 0.7 ? '#ffb700'
+          : '#ff6464';
+      }
+    }
+    // Sync tolerance + view-mode controls from server (after reset/load)
+    if (d.hsv_tol) {
+      document.getElementById('tol-h').value = d.hsv_tol[0];
+      document.getElementById('tol-s').value = d.hsv_tol[1];
+      document.getElementById('tol-v').value = d.hsv_tol[2];
+      document.getElementById('tol-h-val').textContent = d.hsv_tol[0];
+      document.getElementById('tol-s-val').textContent = d.hsv_tol[1];
+      document.getElementById('tol-v-val').textContent = d.hsv_tol[2];
+    }
+    if (d.view_mode) {
+      document.getElementById('view-normal').classList.toggle('active', d.view_mode === 'normal');
+      document.getElementById('view-mask').classList.toggle('active', d.view_mode === 'mask');
+    }
+    if (typeof d.mask_close_radius === 'number') {
+      document.getElementById('close-r').value = d.mask_close_radius;
+      document.getElementById('close-r-val').textContent = d.mask_close_radius;
+    }
+
+    // Ground-truth source-video warning
+    const warn = document.getElementById('src-warning');
+    if (d.manual_source_video && d.current_video &&
+        d.manual_source_video !== d.current_video) {
+      warn.style.display = 'block';
+      const srcShort = d.manual_source_video.split('/').pop();
+      const curShort = d.current_video.split('/').pop();
+      warn.innerHTML =
+        `⚠ Saved manual counts were recorded against <b>${srcShort}</b> ` +
+        `but you opened <b>${curShort}</b>. ` +
+        `Click <b>Reset manual only</b> before live-scoring this clip ` +
+        `(auto counts also need a Reset count).`;
+    } else {
+      warn.style.display = 'none';
+    }
+    document.getElementById('frame-display').textContent =
+      `frame ${d.frame} / ${d.total_frames}`;
+    document.getElementById('area-display').textContent = d.ball_area_px || '--';
+    document.getElementById('hsv-purple').textContent =
+      d.hsv.purple ? d.hsv.purple.join(',') : '--';
+    document.getElementById('hsv-green').textContent =
+      d.hsv.green ? d.hsv.green.join(',') : '--';
+    const fmtLine = ln => ln ?
+      `(${ln[0][0]},${ln[0][1]})→(${ln[1][0]},${ln[1][1]})` : '--';
+    document.getElementById('line-classified-display').textContent =
+      fmtLine(d.lines && d.lines.classified);
+    document.getElementById('line-overflow-display').textContent =
+      fmtLine(d.lines && d.lines.overflow);
+    if (totalFrames !== d.total_frames) {
+      totalFrames = d.total_frames;
+      document.getElementById('scrub').max = Math.max(1, d.total_frames);
+    }
+    if (!_scrubbing) {
+      document.getElementById('scrub').value = d.frame;
+    }
+    updatePlayBtn(d.paused);
+    document.getElementById('pill-purple').classList.toggle('done', !!d.hsv.purple);
+    document.getElementById('pill-green').classList.toggle('done', !!d.hsv.green);
+    document.getElementById('pill-line-classified').classList.toggle('done',
+      !!(d.lines && d.lines.classified));
+    document.getElementById('pill-line-overflow').classList.toggle('done',
+      !!(d.lines && d.lines.overflow));
+  });
+}
+setInterval(updateState, 250);
+updateState();
+</script>
+</body>
+</html>
